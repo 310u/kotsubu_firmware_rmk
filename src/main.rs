@@ -197,16 +197,21 @@ async fn main(spawner: Spawner) {
         use rmk::event::{BatteryStateEvent, SubscribableEvent, EventSubscriber};
         loop {
             let event = sub.next_event().await;
-            let val = event.0 as i32;
-            // XIAO BLE uses a 510K / 1M voltage divider
-            let measured: i32 = 510;
-            let total: i32 = 1510;
-            let percent = if val > 4755 * measured / total {
+            let val = event.0 as u32;
+            // nRF52840 SAADC default: gain=1/6, ref=0.6V, 12-bit
+            //   val = V_in * (1/6) / 0.6 * 4096 → V_in = val * 3600 / 4096 (mV)
+            // XIAO BLE voltage divider: V_bat = V_in * 1510 / 510
+            //   V_bat_mv = val * 3600 / 4096 * 1510 / 510
+            //            = val * 5436600 / 2088960
+            //            ≈ val * 2603 / 1000
+            let v_bat_mv = val * 2603 / 1000;
+            // LiPo: 4200mV=100%, 3000mV=0%
+            let percent: u8 = if v_bat_mv >= 4200 {
                 100
-            } else if val < 4055 * measured / total {
+            } else if v_bat_mv <= 3000 {
                 0
             } else {
-                ((val * total / measured - 4055) / 7) as u8
+                ((v_bat_mv - 3000) * 100 / 1200) as u8
             };
             rmk::event::publish_event(BatteryStateEvent::Normal(percent));
         }
