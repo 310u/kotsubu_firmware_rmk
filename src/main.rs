@@ -133,10 +133,14 @@ async fn main(spawner: Spawner) {
     let flash = Flash::take(mpsl, p.NVMC);
 
     // Initialize the ADC for battery level detection
-    let _batt_enable = Output::new(p.P0_14, Level::Low, OutputDrive::Standard);
+    // Keep P0.14 High (disabled) during calibration to avoid driving the ADC pin
+    let mut batt_enable = Output::new(p.P0_14, Level::High, OutputDrive::Standard);
     let adc_pin = p.P0_31.degrade_saadc();
-    let saadc = init_adc(adc_pin, p.SAADC);
+    let mut saadc = init_adc(adc_pin, p.SAADC);
     saadc.calibrate().await; // Wait for ADC calibration
+    
+    // Enable the voltage divider
+    batt_enable.set_low();
 
     let keyboard_device_config = DeviceConfig {
         vid: 0x4c4b,
