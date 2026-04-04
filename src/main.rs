@@ -9,10 +9,13 @@ mod led_widget;
 use defmt::{info, unwrap};
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_nrf::peripherals::{RNG, USBD};
-use embassy_nrf::usb::Driver;
+use embassy_nrf::gpio::{Level, Output, OutputDrive};
+use embassy_nrf::interrupt::InterruptExt;
+use embassy_nrf::peripherals::{RNG, SAADC, USBD};
+use embassy_nrf::saadc::{self, AnyInput, Input as _, Saadc};
 use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
-use embassy_nrf::{bind_interrupts, pac, rng, usb};
+use embassy_nrf::usb::Driver;
+use embassy_nrf::{bind_interrupts, interrupt, pac, rng, usb, Peri};
 use matrix::KotsubuMatrix;
 use nrf_mpsl::Flash;
 use nrf_sdc::mpsl::MultiprotocolServiceLayer;
@@ -21,11 +24,13 @@ use panic_probe as _;
 use rand_chacha::ChaCha12Rng;
 use rand_core::SeedableRng;
 use rmk::ble::build_ble_stack;
-use rmk::embassy_futures::join::join;
 use rmk::config::{BleBatteryConfig, DeviceConfig, RmkConfig, StorageConfig, VialConfig};
+use rmk::embassy_futures::join::{join, join3};
+use rmk::input_device::adc::{AnalogEventType, NrfAdc};
+use rmk::input_device::battery::BatteryProcessor;
 use rmk::input_device::Runnable;
 use rmk::keyboard::Keyboard;
-use rmk::{HostResources, KeymapData, initialize_keymap_and_storage, run_rmk};
+use rmk::{initialize_keymap_and_storage, run_rmk, HostResources, KeymapData};
 use static_cell::StaticCell;
 use vial::{VIAL_KEYBOARD_DEF, VIAL_KEYBOARD_ID};
 use led_widget::{rgb_widget_task, RgbLed};
@@ -33,6 +38,7 @@ use led_widget::{rgb_widget_task, RgbLed};
 bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<USBD>;
     RNG => rng::InterruptHandler<RNG>;
+    SAADC => saadc::InterruptHandler;
     EGU0_SWI0 => nrf_sdc::mpsl::LowPrioInterruptHandler;
     CLOCK_POWER => nrf_sdc::mpsl::ClockInterruptHandler, usb::vbus_detect::InterruptHandler;
     RADIO => nrf_sdc::mpsl::HighPrioInterruptHandler;
@@ -49,6 +55,14 @@ const L2CAP_TXQ: u8 = 3;
 const L2CAP_RXQ: u8 = 3;
 const L2CAP_MTU: usize = 251;
 const UNLOCK_KEYS: &[(u8, u8)] = &[(0, 0), (0, 1)];
+
+/// Initializes the SAADC peripheral in single-ended mode on the given pin.
+fn init_adc(adc_pin: AnyInput, adc: Peri<'static, SAADC>) -> Saadc<'static, 1> {
+    let config = saadc::Config::default();
+    let channel_cfg = saadc::ChannelConfig::single_ended(adc_pin.degrade_saadc());
+    interrupt::SAADC.set_priority(interrupt::Priority::P3);
+    saadc::Saadc::new(adc, Irqs, config, [channel_cfg])
+}
 
 fn build_sdc<'d, const N: usize>(
     p: nrf_sdc::Peripherals<'d>,
@@ -118,6 +132,12 @@ async fn main(spawner: Spawner) {
     let driver = Driver::new(p.USBD, Irqs, HardwareVbusDetect::new(Irqs));
     let flash = Flash::take(mpsl, p.NVMC);
 
+    // Initialize the ADC for battery level detection
+    let _batt_enable = Output::new(p.P0_14, Level::Low, OutputDrive::Standard);
+    let adc_pin = p.P0_31.degrade_saadc();
+    let saadc = init_adc(adc_pin, p.SAADC);
+    saadc.calibrate().await; // Wait for ADC calibration
+
     let keyboard_device_config = DeviceConfig {
         vid: 0x4c4b,
         pid: 0x4b32,
@@ -162,8 +182,17 @@ async fn main(spawner: Spawner) {
     );
     spawner.spawn(unwrap!(rgb_widget_task(rgb_led)));
 
-    join(
+    let mut adc_device = NrfAdc::new(
+        saadc,
+        [AnalogEventType::Battery],
+        embassy_time::Duration::from_secs(10),
+        None,
+    );
+    let mut batt_proc = BatteryProcessor::new(1250, 1600);
+
+    join3(
         matrix.run(),
+        join(adc_device.run(), batt_proc.run()),
         join(
             keyboard.run(),
             run_rmk(&keymap, driver, &stack, &mut storage, rmk_config),
