@@ -188,7 +188,8 @@ async fn main(spawner: Spawner) {
         embassy_time::Duration::from_secs(10),
         None,
     );
-    let mut batt_proc = BatteryProcessor::new(1250, 1600);
+    // XIAO BLE uses a 510K / 1M voltage divider for battery measurement
+    let mut batt_proc = BatteryProcessor::new(510, 1510);
 
     join3(
         matrix.run(),
