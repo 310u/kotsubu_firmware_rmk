@@ -2,6 +2,14 @@
 
 Kotsubu keyboard firmware ported to RMK for `Seeed Studio XIAO nRF52840`.
 
+## 機能 (Features)
+
+- **Bluetooth & USB有線接続**: 無線（BLE）と有線（USB）両方の接続にネイティブ対応。
+- **マルチペアリング対応**: 最大4台までのデバイス（PCやスマホなど）を記憶でき、プロファイルの切り替えが可能。
+- **Vial / VIA対応**: 専用ソフト不要で、ブラウザ上のVial Webなどからリアルタイムにキーマップや設定を書き換え可能。
+- **ステータス表示LED（RGB LED Widget）**: XIAO BLE本体のフルカラーLEDを活用し、現在のBluetooth接続状況、選択中のプロファイル、およびバッテリー残量を光の色と点滅で直感的に表示。
+- **ドラッグ＆ドロップでの書き込み**: UF2ブートローダーに対応しており、USBドライブとして認識させた本体にファームウェアのファイルをコピーするだけで簡単にアップデート可能。
+
 ## Prerequisites
 
 ### Common
