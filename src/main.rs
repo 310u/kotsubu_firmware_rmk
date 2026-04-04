@@ -188,12 +188,29 @@ async fn main(spawner: Spawner) {
         embassy_time::Duration::from_secs(10),
         None,
     );
-    // XIAO BLE uses a 510K / 1M voltage divider for battery measurement
-    let mut batt_proc = BatteryProcessor::new(510, 1510);
+    let batt_proc_task = async {
+        let mut sub = rmk::event::BatteryAdcEvent::subscriber();
+        use rmk::event::{BatteryStateEvent, SubscribableEvent, EventSubscriber};
+        loop {
+            let event = sub.next_event().await;
+            let val = event.0 as i32;
+            // XIAO BLE uses a 510K / 1M voltage divider
+            let measured: i32 = 510;
+            let total: i32 = 1510;
+            let percent = if val > 4755 * measured / total {
+                100
+            } else if val < 4055 * measured / total {
+                0
+            } else {
+                ((val * total / measured - 4055) / 7) as u8
+            };
+            rmk::event::publish_event(BatteryStateEvent::Normal(percent));
+        }
+    };
 
     join3(
         matrix.run(),
-        join(adc_device.run(), batt_proc.run()),
+        join(adc_device.run(), batt_proc_task),
         join(
             keyboard.run(),
             run_rmk(&keymap, driver, &stack, &mut storage, rmk_config),
