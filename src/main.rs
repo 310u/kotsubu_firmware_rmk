@@ -198,10 +198,16 @@ async fn main(spawner: Spawner) {
         loop {
             let event = sub.next_event().await;
             let val = event.0 as i32;
-            // DEBUG: Display raw ADC voltage directly as 0-100%
-            // Full scale is 4096. This will show about 38% for 4.2V if working properly.
-            // If it shows 0%, it means the hardware is reading 0V and P0.14 is not functioning as expected.
-            let percent = ((val * 100) / 4096) as u8;
+            // XIAO BLE uses a 510K / 1M voltage divider
+            let measured: i32 = 510;
+            let total: i32 = 1510;
+            let percent = if val > 4755 * measured / total {
+                100
+            } else if val < 4055 * measured / total {
+                0
+            } else {
+                ((val * total / measured - 4055) / 7) as u8
+            };
             rmk::event::publish_event(BatteryStateEvent::Normal(percent));
         }
     };
