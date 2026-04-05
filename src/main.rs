@@ -2,9 +2,10 @@
 #![no_main]
 
 mod keymap;
-mod matrix;
-mod vial;
 mod led_widget;
+mod matrix;
+mod power;
+mod vial;
 
 use defmt::{info, unwrap};
 use defmt_rtt as _;
@@ -13,9 +14,11 @@ use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_nrf::interrupt::InterruptExt;
 use embassy_nrf::peripherals::{RNG, SAADC, USBD};
 use embassy_nrf::saadc::{self, AnyInput, Input as _, Saadc};
-use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::usb::Driver;
-use embassy_nrf::{bind_interrupts, interrupt, pac, rng, usb, Peri};
+use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
+use embassy_nrf::{Peri, bind_interrupts, interrupt, pac, rng, usb};
+use embassy_time::Timer;
+use led_widget::{RgbLed, rgb_widget_task};
 use matrix::KotsubuMatrix;
 use nrf_mpsl::Flash;
 use nrf_sdc::mpsl::MultiprotocolServiceLayer;
@@ -26,14 +29,13 @@ use rand_core::SeedableRng;
 use rmk::ble::build_ble_stack;
 use rmk::config::{BleBatteryConfig, DeviceConfig, RmkConfig, StorageConfig, VialConfig};
 use rmk::embassy_futures::join::{join, join3};
-use rmk::input_device::adc::{AnalogEventType, NrfAdc};
-use rmk::input_device::battery::BatteryProcessor;
+use rmk::embassy_futures::select::{Either, select};
+use rmk::event::{BatteryStateEvent, publish_event};
 use rmk::input_device::Runnable;
 use rmk::keyboard::Keyboard;
-use rmk::{initialize_keymap_and_storage, run_rmk, HostResources, KeymapData};
+use rmk::{HostResources, KeymapData, initialize_keymap_and_storage, run_rmk};
 use static_cell::StaticCell;
 use vial::{VIAL_KEYBOARD_DEF, VIAL_KEYBOARD_ID};
-use led_widget::{rgb_widget_task, RgbLed};
 
 bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<USBD>;
@@ -89,6 +91,25 @@ fn ble_addr() -> [u8; 6] {
     unwrap!(addr.to_le_bytes()[..6].try_into())
 }
 
+fn battery_percent_from_adc(val: u16) -> u8 {
+    let val = val as u32;
+    // nRF52840 SAADC default: gain=1/6, ref=0.6V, 12-bit
+    //   val = V_in * (1/6) / 0.6 * 4096 -> V_in = val * 3600 / 4096 (mV)
+    // XIAO BLE voltage divider: V_bat = V_in * 1510 / 510
+    //   V_bat_mv = val * 3600 / 4096 * 1510 / 510
+    //            = val * 5436600 / 2088960
+    //            ~= val * 2603 / 1000
+    let v_bat_mv = val * 2603 / 1000;
+
+    if v_bat_mv >= 4200 {
+        100
+    } else if v_bat_mv <= 3000 {
+        0
+    } else {
+        ((v_bat_mv - 3000) * 100 / 1200) as u8
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     info!("Starting Kotsubu RMK");
@@ -98,6 +119,16 @@ async fn main(spawner: Spawner) {
     nrf_config.dcdc.reg0 = true;
     nrf_config.dcdc.reg1 = true;
     let p = embassy_nrf::init(nrf_config);
+    power::init();
+
+    let reset_reasons = pac::POWER.resetreas().read().0;
+    if reset_reasons != 0 {
+        info!("Reset reasons: 0x{:08x}", reset_reasons);
+        if reset_reasons & (1 << 5) != 0 {
+            info!("Woke from System OFF");
+        }
+        pac::POWER.resetreas().write(|w| w.0 = reset_reasons);
+    }
 
     let mpsl_p =
         mpsl::Peripherals::new(p.RTC0, p.TIMER0, p.TEMP, p.PPI_CH19, p.PPI_CH30, p.PPI_CH31);
@@ -138,9 +169,9 @@ async fn main(spawner: Spawner) {
     let adc_pin = p.P0_31.degrade_saadc();
     let mut saadc = init_adc(adc_pin, p.SAADC);
     saadc.calibrate().await; // Wait for ADC calibration
-    
-    // Enable the voltage divider
-    batt_enable.set_low();
+
+    // Leave the voltage divider disabled until a sample is requested.
+    batt_enable.set_high();
 
     let keyboard_device_config = DeviceConfig {
         vid: 0x4c4b,
@@ -180,46 +211,51 @@ async fn main(spawner: Spawner) {
     let mut keyboard = Keyboard::new(&keymap);
 
     let rgb_led = RgbLed::new(
-        embassy_nrf::gpio::Output::new(p.P0_26, embassy_nrf::gpio::Level::High, embassy_nrf::gpio::OutputDrive::Standard),
-        embassy_nrf::gpio::Output::new(p.P0_30, embassy_nrf::gpio::Level::High, embassy_nrf::gpio::OutputDrive::Standard),
-        embassy_nrf::gpio::Output::new(p.P0_06, embassy_nrf::gpio::Level::High, embassy_nrf::gpio::OutputDrive::Standard),
+        embassy_nrf::gpio::Output::new(
+            p.P0_26,
+            embassy_nrf::gpio::Level::High,
+            embassy_nrf::gpio::OutputDrive::Standard,
+        ),
+        embassy_nrf::gpio::Output::new(
+            p.P0_30,
+            embassy_nrf::gpio::Level::High,
+            embassy_nrf::gpio::OutputDrive::Standard,
+        ),
+        embassy_nrf::gpio::Output::new(
+            p.P0_06,
+            embassy_nrf::gpio::Level::High,
+            embassy_nrf::gpio::OutputDrive::Standard,
+        ),
     );
     spawner.spawn(unwrap!(rgb_widget_task(rgb_led)));
 
-    let mut adc_device = NrfAdc::new(
-        saadc,
-        [AnalogEventType::Battery],
-        embassy_time::Duration::from_secs(10),
-        None,
-    );
-    let batt_proc_task = async {
-        let mut sub = rmk::event::BatteryAdcEvent::subscriber();
-        use rmk::event::{BatteryStateEvent, SubscribableEvent, EventSubscriber};
+    let mut activity_rx = power::ACTIVITY_WATCH.receiver().unwrap();
+    let battery_task = async move {
+        let mut sample_buf = [0i16; 1];
         loop {
-            let event = sub.next_event().await;
-            let val = event.0 as u32;
-            // nRF52840 SAADC default: gain=1/6, ref=0.6V, 12-bit
-            //   val = V_in * (1/6) / 0.6 * 4096 → V_in = val * 3600 / 4096 (mV)
-            // XIAO BLE voltage divider: V_bat = V_in * 1510 / 510
-            //   V_bat_mv = val * 3600 / 4096 * 1510 / 510
-            //            = val * 5436600 / 2088960
-            //            ≈ val * 2603 / 1000
-            let v_bat_mv = val * 2603 / 1000;
-            // LiPo: 4200mV=100%, 3000mV=0%
-            let percent: u8 = if v_bat_mv >= 4200 {
-                100
-            } else if v_bat_mv <= 3000 {
-                0
+            batt_enable.set_low();
+            Timer::after_micros(50).await;
+            saadc.sample(&mut sample_buf).await;
+            batt_enable.set_high();
+
+            let percent = battery_percent_from_adc(sample_buf[0] as u16);
+            publish_event(BatteryStateEvent::Normal(percent));
+
+            let wait_secs = power::battery_interval_secs();
+            if wait_secs == power::BATTERY_ACTIVE_INTERVAL_SECS {
+                Timer::after_secs(wait_secs).await;
             } else {
-                ((v_bat_mv - 3000) * 100 / 1200) as u8
-            };
-            rmk::event::publish_event(BatteryStateEvent::Normal(percent));
+                match select(Timer::after_secs(wait_secs), activity_rx.changed()).await {
+                    Either::First(_) => {}
+                    Either::Second(_) => continue,
+                }
+            }
         }
     };
 
     join3(
         matrix.run(),
-        join(adc_device.run(), batt_proc_task),
+        join(power::sleep_manager_task(), battery_task),
         join(
             keyboard.run(),
             run_rmk(&keymap, driver, &stack, &mut storage, rmk_config),

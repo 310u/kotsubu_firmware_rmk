@@ -1,10 +1,10 @@
 use defmt::info;
-use rmk::embassy_futures::select::{select, Either};
 use embassy_nrf::gpio::Output;
 use embassy_time::{Duration, Instant, Timer};
+use rmk::embassy_futures::select::{Either, select};
 use rmk::event::{
     BatteryStateEvent, BleStatusChangeEvent, ConnectionChangeEvent, ConnectionType,
-    EventSubscriber, SubscribableEvent,
+    EventSubscriber, SleepStateEvent, SubscribableEvent,
 };
 use rmk::types::ble::BleState;
 
@@ -53,7 +53,7 @@ pub enum RgbEvent {
     ConnChange(ConnectionChangeEvent),
     BleStatusChange(BleStatusChangeEvent),
     BatChange(BatteryStateEvent),
-    TimerTick,
+    SleepChange(SleepStateEvent),
 }
 
 #[embassy_executor::task]
@@ -62,12 +62,14 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
     //#[cfg(feature = "_ble")]
     let mut ble_sub = BleStatusChangeEvent::subscriber();
     let mut bat_sub = BatteryStateEvent::subscriber();
+    let mut sleep_sub = SleepStateEvent::subscriber();
 
     // Turn off initially
     led.set_color(false, false, false);
 
     // Initial sequence: wait up to 2 seconds for a battery event to show boot status
-    if let Ok(bat) = embassy_time::with_timeout(Duration::from_secs(2), bat_sub.next_event()).await {
+    if let Ok(bat) = embassy_time::with_timeout(Duration::from_secs(2), bat_sub.next_event()).await
+    {
         if let Some(percentage) = get_bat_percentage(bat) {
             info!("Boot battery level: {}%", percentage);
             if percentage >= 50 {
@@ -86,11 +88,11 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
         info!("No battery event received at boot within timeout");
     }
 
-    let mut is_ble = false;
     let mut is_adv = false;
     let mut is_conn = false;
     let mut current_profile = 0;
     let mut bat_critical = false;
+    let mut is_sleeping = false;
 
     // Temporary override (e.g. for connection success)
     let mut temp_color_until: Option<(Instant, (bool, bool, bool))> = None;
@@ -123,13 +125,14 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
         let ev_fut = async {
             match select(
                 select(conn_sub.next_event(), ble_sub.next_event()),
-                bat_sub.next_event(),
+                select(bat_sub.next_event(), sleep_sub.next_event()),
             )
             .await
             {
                 Either::First(Either::First(conn)) => RgbEvent::ConnChange(conn),
                 Either::First(Either::Second(ble)) => RgbEvent::BleStatusChange(ble),
-                Either::Second(bat) => RgbEvent::BatChange(bat),
+                Either::Second(Either::First(bat)) => RgbEvent::BatChange(bat),
+                Either::Second(Either::Second(sleep)) => RgbEvent::SleepChange(sleep),
             }
         };
 
@@ -137,7 +140,7 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
             Either::First(event) => {
                 match event {
                     RgbEvent::ConnChange(conn) => {
-                        is_ble = conn.connection_type == ConnectionType::Ble;
+                        let is_ble = conn.connection_type == ConnectionType::Ble;
                         info!("Conn change event: is_ble={}", is_ble);
                         if !is_ble {
                             // USB connected: show white briefly
@@ -158,7 +161,7 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
                         }
 
                         is_adv = ble.0.state == BleState::Advertising;
-                        
+
                         let new_conn = ble.0.state == BleState::Connected;
                         if !is_conn && new_conn {
                             // Just connected: show profile color for 3 secs
@@ -187,15 +190,21 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
                             } else if !critical && bat_critical {
                                 bat_critical = false;
                             } else if critical {
-                               // critical state continued, just blink warning
-                               temp_color_until = Some((
+                                // critical state continued, just blink warning
+                                temp_color_until = Some((
                                     Instant::now() + Duration::from_millis(1500),
                                     (true, false, false), // Red
                                 ));
                             }
                         }
                     }
-                    _ => {}
+                    RgbEvent::SleepChange(sleep) => {
+                        is_sleeping = sleep.sleeping;
+                        if is_sleeping {
+                            temp_color_until = None;
+                            blink_state = false;
+                        }
+                    }
                 }
             }
             Either::Second(_) => {
@@ -206,17 +215,23 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
                         temp_color_until = None;
                     }
                 }
-                
+
                 if temp_color_until.is_none() && (is_adv || bat_critical) {
                     if now >= next_blink_time {
                         blink_state = !blink_state;
-                        next_blink_time = now + Duration::from_millis(if blink_state { 200 } else { 800 });
+                        next_blink_time =
+                            now + Duration::from_millis(if blink_state { 200 } else { 800 });
                     }
                 }
             }
         }
 
         // Apply colors
+        if is_sleeping {
+            led.set_color(false, false, false);
+            continue;
+        }
+
         if let Some((_, color)) = temp_color_until {
             led.set_color(color.0, color.1, color.2);
         } else if is_adv {
@@ -240,10 +255,10 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
 
 fn profile_color(profile: u8) -> (bool, bool, bool) {
     match profile {
-        0 => (true, false, false),  // Red
-        1 => (false, true, false),  // Green
-        2 => (true, true, false),   // Yellow
-        3 => (false, false, true),  // Blue
-        _ => (true, false, true),   // Magenta (fallback)
+        0 => (true, false, false), // Red
+        1 => (false, true, false), // Green
+        2 => (true, true, false),  // Yellow
+        3 => (false, false, true), // Blue
+        _ => (true, false, true),  // Magenta (fallback)
     }
 }
