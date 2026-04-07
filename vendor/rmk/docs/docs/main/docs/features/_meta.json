@@ -1,0 +1,15 @@
+[
+  "matrix",
+  "layers",
+  "wireless",
+  "configuration",
+  "low_power",
+  "split_keyboard",
+  "vial_support",
+  "usb_logging",
+  "storage",
+  "use_rust_api",
+  "processor",
+  "input_device",
+  "binary_size_optimization"
+]

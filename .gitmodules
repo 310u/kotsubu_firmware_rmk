@@ -1,3 +1,0 @@
-[submodule "vendor/rmk"]
-	path = vendor/rmk
-	url = https://github.com/HaoboGu/rmk.git
