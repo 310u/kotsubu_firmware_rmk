@@ -1,6 +1,6 @@
-# Kotsubu RMK
+# 星見薄荷・小粒 RMK
 
-Kotsubu keyboard firmware ported to RMK for `Seeed Studio XIAO nRF52840`.
+「星見薄荷・小粒」向けに RMK へ移植したキーボードファームウェアです。`Seeed Studio XIAO nRF52840` を使用します。
 
 ## 機能 (Features)
 
