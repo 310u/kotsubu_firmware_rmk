@@ -147,3 +147,10 @@ bash scripts/build_uf2.sh
 # Copy UF2 to the mounted bootloader drive
 bash scripts/flash_uf2.sh
 ```
+
+## License
+
+This project is licensed under either of the following, at your option:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](/home/satoyu/ドキュメント/git/kotsubu_firmware_rmk/LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](/home/satoyu/ドキュメント/git/kotsubu_firmware_rmk/LICENSE-MIT))
