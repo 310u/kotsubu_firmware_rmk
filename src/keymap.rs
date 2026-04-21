@@ -13,9 +13,9 @@ const BASE: u8 = 0;
 const LOWER: u8 = 1;
 
 const HOME_ROW_PROFILE: MorseProfile =
-    MorseProfile::new(Some(true), Some(MorseMode::Normal), Some(225), Some(250));
+    MorseProfile::new(Some(true), Some(MorseMode::Normal), None, None);
 const THUMB_PROFILE: MorseProfile =
-    MorseProfile::new(None, Some(MorseMode::Normal), Some(175), Some(250));
+    MorseProfile::new(None, Some(MorseMode::Normal), None, None);
 
 const HRM_A: KeyAction = mtp!(A, ModifierCombination::LCTRL, HOME_ROW_PROFILE);
 const HRM_Z: KeyAction = mtp!(Z, ModifierCombination::LSHIFT, HOME_ROW_PROFILE);
