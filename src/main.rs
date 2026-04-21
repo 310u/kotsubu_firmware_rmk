@@ -12,8 +12,9 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_nrf::interrupt::InterruptExt;
-use embassy_nrf::peripherals::{RNG, SAADC, USBD};
+use embassy_nrf::peripherals::{RNG, SAADC, TWISPI0, USBD};
 use embassy_nrf::saadc::{self, AnyInput, Input as _, Saadc};
+use embassy_nrf::spim;
 use embassy_nrf::usb::Driver;
 use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::{Peri, bind_interrupts, interrupt, pac, rng, usb};
@@ -41,6 +42,7 @@ bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<USBD>;
     RNG => rng::InterruptHandler<RNG>;
     SAADC => saadc::InterruptHandler;
+    TWISPI0 => spim::InterruptHandler<TWISPI0>;
     EGU0_SWI0 => nrf_sdc::mpsl::LowPrioInterruptHandler;
     CLOCK_POWER => nrf_sdc::mpsl::ClockInterruptHandler, usb::vbus_detect::InterruptHandler;
     RADIO => nrf_sdc::mpsl::HighPrioInterruptHandler;
@@ -205,8 +207,13 @@ async fn main(spawner: Spawner) {
     )
     .await;
 
+    let mut shift_spi_config = spim::Config::default();
+    shift_spi_config.frequency = spim::Frequency::M4;
+    shift_spi_config.mode = spim::MODE_0;
+    let shift_spi = spim::Spim::new_txonly(p.TWISPI0, Irqs, p.P1_13, p.P1_15, shift_spi_config);
+
     let mut matrix = KotsubuMatrix::new(
-        p.P0_28, p.P0_29, p.P0_04, p.P0_05, p.P0_02, p.P0_03, p.P1_13, p.P1_15, p.P1_12,
+        p.P0_28, p.P0_29, p.P0_04, p.P0_05, p.P0_02, p.P0_03, shift_spi, p.P1_12,
     );
     let mut keyboard = Keyboard::new(&keymap);
 

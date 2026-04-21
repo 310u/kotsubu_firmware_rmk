@@ -1,9 +1,10 @@
-use defmt::info;
+use defmt::{info, unwrap};
 use embassy_nrf::Peri;
 use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pin, Port, Pull};
 use embassy_nrf::pac;
-use embassy_nrf::peripherals::{P0_02, P0_03, P0_04, P0_05, P0_28, P0_29, P1_12, P1_13, P1_15};
+use embassy_nrf::peripherals::{P0_02, P0_03, P0_04, P0_05, P0_28, P0_29, P1_12};
 use embassy_nrf::power as nrf_power;
+use embassy_nrf::spim;
 use embassy_time::{Duration, Instant, Timer};
 use rmk::debounce::default_debouncer::DefaultDebouncer;
 use rmk::debounce::{DebounceState, DebouncerTrait};
@@ -22,8 +23,7 @@ enum WaitForKeyResult {
 pub struct KotsubuMatrix {
     rows: [Input<'static>; 4],
     direct_cols: [Output<'static>; 2],
-    shift_clock: Output<'static>,
-    shift_data: Output<'static>,
+    shift_spi: spim::Spim<'static>,
     shift_latch: Output<'static>,
     debouncer: DefaultDebouncer<4, 10>,
     key_states: [[KeyState; 4]; 10],
@@ -49,8 +49,7 @@ impl KotsubuMatrix {
         row3: Peri<'static, P0_05>,
         col8: Peri<'static, P0_02>,
         col9: Peri<'static, P0_03>,
-        shift_clock: Peri<'static, P1_13>,
-        shift_data: Peri<'static, P1_15>,
+        shift_spi: spim::Spim<'static>,
         shift_latch: Peri<'static, P1_12>,
     ) -> Self {
         let row_pin_ports = [
@@ -70,8 +69,7 @@ impl KotsubuMatrix {
                 Output::new(col8, Level::Low, OutputDrive::Standard),
                 Output::new(col9, Level::Low, OutputDrive::Standard),
             ],
-            shift_clock: Output::new(shift_clock, Level::Low, OutputDrive::Standard),
-            shift_data: Output::new(shift_data, Level::Low, OutputDrive::Standard),
+            shift_spi,
             shift_latch: Output::new(shift_latch, Level::Low, OutputDrive::Standard),
             debouncer: DefaultDebouncer::new(),
             key_states: [[KeyState::new(); 4]; 10],
@@ -93,20 +91,8 @@ impl KotsubuMatrix {
 
     async fn write_shift_register(&mut self, value: u8) {
         self.shift_latch.set_low();
-        self.shift_clock.set_low();
-
-        for bit in (0..8).rev() {
-            if (value >> bit) & 1 == 1 {
-                self.shift_data.set_high();
-            } else {
-                self.shift_data.set_low();
-            }
-            self.shift_clock.set_high();
-            self.shift_clock.set_low();
-        }
-
+        unwrap!(self.shift_spi.write(&[value]).await);
         self.shift_latch.set_high();
-        self.shift_data.set_low();
     }
 
     async fn clear_columns(&mut self) {
