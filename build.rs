@@ -18,9 +18,13 @@ use std::{env, fs};
 use const_gen::*;
 use xz2::read::XzEncoder;
 
+#[path = "src/unified_policy.rs"]
+mod unified_policy;
+
 fn main() {
     // Generate vial config at the root of project
     generate_vial_config();
+    validate_unified_policy();
 
     // Put `memory.x` in our output directory and ensure it's
     // on the linker search path.
@@ -49,6 +53,77 @@ fn main() {
 
     // Set the extra linker script from defmt
     println!("cargo:rustc-link-arg=-Tdefmt.x");
+}
+
+fn validate_unified_policy() {
+    let keyboard_toml = fs::read_to_string("keyboard.toml").expect("Cannot read keyboard.toml");
+    let expected_profiles = unified_policy::BLE_PROFILE_COUNT.to_string();
+    assert_toml_value(&keyboard_toml, "rmk", "ble_profiles_num", &expected_profiles);
+    assert_toml_value(&keyboard_toml, "ble", "enabled", "true");
+    assert_toml_value(
+        &keyboard_toml,
+        "ble",
+        "passkey_entry",
+        if unified_policy::PASSKEY_ENTRY_ENABLED {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    let expected_timeout = unified_policy::PASSKEY_ENTRY_TIMEOUT_SECS.to_string();
+    assert_toml_value(
+        &keyboard_toml,
+        "ble",
+        "passkey_entry_timeout",
+        &expected_timeout,
+    );
+
+    let cargo_toml = fs::read_to_string("Cargo.toml").expect("Cannot read Cargo.toml");
+    let has_passkey_feature = cargo_toml.contains("\"passkey_entry\"");
+    if has_passkey_feature != unified_policy::PASSKEY_ENTRY_ENABLED {
+        panic!(
+            "Cargo.toml passkey_entry feature must match unified policy (expected {}, found {})",
+            unified_policy::PASSKEY_ENTRY_ENABLED,
+            has_passkey_feature
+        );
+    }
+}
+
+fn assert_toml_value(content: &str, section: &str, key: &str, expected: &str) {
+    match find_toml_value(content, section, key) {
+        Some(actual) if actual == expected => {}
+        Some(actual) => panic!(
+            "keyboard.toml [{}].{} must be {}, found {}",
+            section, key, expected, actual
+        ),
+        None => panic!("keyboard.toml is missing [{}].{}", section, key),
+    }
+}
+
+fn find_toml_value(content: &str, section: &str, key: &str) -> Option<String> {
+    let mut current_section = String::new();
+
+    for raw_line in content.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with('[') && line.ends_with(']') {
+            current_section = line[1..line.len() - 1].trim().to_string();
+            continue;
+        }
+
+        let Some((lhs, rhs)) = line.split_once('=') else {
+            continue;
+        };
+
+        if current_section == section && lhs.trim() == key {
+            return Some(rhs.trim().trim_matches('"').to_string());
+        }
+    }
+
+    None
 }
 
 fn generate_vial_config() {

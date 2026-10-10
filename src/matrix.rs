@@ -15,25 +15,34 @@ use rmk::matrix::KeyState;
 
 use crate::power;
 
+const ROW_COUNT: usize = 4;
+const COL_COUNT: usize = 10;
+const SHIFT_COL_COUNT: usize = 8;
+const DIRECT_COL_COUNT: usize = COL_COUNT - SHIFT_COL_COUNT;
+const ALL_DIRECT_COLS_MASK: u8 = (1u8 << DIRECT_COL_COUNT) - 1;
+
 enum WaitForKeyResult {
     KeyPressed,
     DeepSleepDeadlineReached,
 }
 
 pub struct KotsubuMatrix {
-    rows: [Input<'static>; 4],
-    direct_cols: [Output<'static>; 2],
+    rows: [Input<'static>; ROW_COUNT],
+    direct_cols: [Output<'static>; DIRECT_COL_COUNT],
     shift_spi: spim::Spim<'static>,
     shift_latch: Output<'static>,
-    debouncer: DefaultDebouncer<4, 10>,
-    key_states: [[KeyState; 4]; 10],
+    debouncer: DefaultDebouncer<ROW_COUNT, COL_COUNT>,
+    key_states: [[KeyState; ROW_COUNT]; COL_COUNT],
     scan_pos: (usize, usize),
-    row_pin_ports: [u8; 4],
+    row_pin_ports: [u8; ROW_COUNT],
     stay_awake_until: Option<Instant>,
+    cached_shift_value: Option<u8>,
+    direct_col_mask: u8,
 }
 
 impl KotsubuMatrix {
-    const SHIFT_COL_BITS: [u8; 8] = [0, 1, 2, 3, 4, 7, 6, 5];
+    // PCB wiring maps logical columns 0..=7 to 74HC595 outputs Q0, Q1, Q2, Q3, Q4, Q7, Q6, Q5.
+    const SHIFT_COL_BITS: [u8; SHIFT_COL_COUNT] = [0, 1, 2, 3, 4, 7, 6, 5];
 
     fn pin_port<P: Pin>(pin: &P) -> u8 {
         match pin.port() {
@@ -72,17 +81,19 @@ impl KotsubuMatrix {
             shift_spi,
             shift_latch: Output::new(shift_latch, Level::Low, OutputDrive::Standard),
             debouncer: DefaultDebouncer::new(),
-            key_states: [[KeyState::new(); 4]; 10],
+            key_states: [[KeyState::new(); ROW_COUNT]; COL_COUNT],
             scan_pos: (0, 0),
             row_pin_ports,
             stay_awake_until: None,
+            cached_shift_value: None,
+            direct_col_mask: 0,
         };
         matrix.shift_latch.set_high();
         matrix
     }
 
     fn shift_mask(col: usize) -> u8 {
-        if col < 8 {
+        if col < SHIFT_COL_COUNT {
             1 << Self::SHIFT_COL_BITS[col]
         } else {
             0
@@ -95,25 +106,62 @@ impl KotsubuMatrix {
         self.shift_latch.set_high();
     }
 
+    async fn set_shift_outputs(&mut self, value: u8) {
+        if self.cached_shift_value == Some(value) {
+            return;
+        }
+
+        self.write_shift_register(value).await;
+        self.cached_shift_value = Some(value);
+    }
+
+    fn set_direct_columns(&mut self, mask: u8) {
+        if self.direct_col_mask == mask {
+            return;
+        }
+
+        for (idx, col) in self.direct_cols.iter_mut().enumerate() {
+            let bit = 1u8 << idx;
+            if self.direct_col_mask & bit != 0 && mask & bit == 0 {
+                col.set_low();
+            }
+        }
+
+        for (idx, col) in self.direct_cols.iter_mut().enumerate() {
+            let bit = 1u8 << idx;
+            if self.direct_col_mask & bit == 0 && mask & bit != 0 {
+                col.set_high();
+            }
+        }
+
+        self.direct_col_mask = mask;
+    }
+
+    async fn apply_column_state(&mut self, shift_value: u8, direct_mask: u8) {
+        // When switching away from a direct GPIO-driven column, drop it before enabling the
+        // next column so we never momentarily drive two columns at once.
+        if self.direct_col_mask != 0 && direct_mask == 0 {
+            self.set_direct_columns(0);
+        }
+
+        self.set_shift_outputs(shift_value).await;
+        self.set_direct_columns(direct_mask);
+    }
+
     async fn clear_columns(&mut self) {
-        self.direct_cols[0].set_low();
-        self.direct_cols[1].set_low();
-        self.write_shift_register(0).await;
+        self.apply_column_state(0, 0).await;
     }
 
     async fn set_all_columns_high(&mut self) {
-        self.direct_cols[0].set_high();
-        self.direct_cols[1].set_high();
-        self.write_shift_register(0xFF).await;
+        self.apply_column_state(0xFF, ALL_DIRECT_COLS_MASK).await;
     }
 
     async fn select_column(&mut self, col: usize) {
-        self.clear_columns().await;
-
-        if col < 8 {
-            self.write_shift_register(Self::shift_mask(col)).await;
+        if col < SHIFT_COL_COUNT {
+            self.apply_column_state(Self::shift_mask(col), 0).await;
         } else {
-            self.direct_cols[col - 8].set_high();
+            self.apply_column_state(0, 1u8 << (col - SHIFT_COL_COUNT))
+                .await;
         }
     }
 
@@ -193,12 +241,12 @@ impl KotsubuMatrix {
         loop {
             let (start_col, start_row) = self.scan_pos;
 
-            for col in start_col..10 {
+            for col in start_col..COL_COUNT {
                 self.select_column(col).await;
                 Timer::after_micros(1).await;
 
                 let row_start = if col == start_col { start_row } else { 0 };
-                for row in row_start..4 {
+                for row in row_start..ROW_COUNT {
                     let pressed = self.rows[row].is_high();
                     let debounce = self.debouncer.detect_change_with_debounce(
                         row,
@@ -216,10 +264,9 @@ impl KotsubuMatrix {
                         return KeyboardEvent::key(row as u8, col as u8, pressed);
                     }
                 }
-
-                self.clear_columns().await;
             }
 
+            self.clear_columns().await;
             self.scan_pos = (0, 0);
             if let Some(until) = self.stay_awake_until {
                 if Instant::now() < until {

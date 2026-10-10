@@ -1,10 +1,12 @@
 #![no_std]
 #![no_main]
 
+mod board_config;
 mod keymap;
 mod led_widget;
 mod matrix;
 mod power;
+mod unified_policy;
 mod vial;
 
 use defmt::{info, unwrap};
@@ -58,7 +60,6 @@ async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
 const L2CAP_TXQ: u8 = 3;
 const L2CAP_RXQ: u8 = 3;
 const L2CAP_MTU: usize = 251;
-const UNLOCK_KEYS: &[(u8, u8)] = &[(0, 0), (0, 1)];
 
 /// Initializes the SAADC peripheral in single-ended mode on the given pin.
 fn init_adc(adc_pin: AnyInput, adc: Peri<'static, SAADC>) -> Saadc<'static, 1> {
@@ -176,16 +177,20 @@ async fn main(spawner: Spawner) {
     batt_enable.set_high();
 
     let keyboard_device_config = DeviceConfig {
-        vid: 0x4c4b,
-        pid: 0x4b32,
-        manufacturer: "310u",
-        product_name: "Kotsubu RMK",
-        serial_number: "vial:kotsubu:000001",
+        vid: board_config::USB_VENDOR_ID,
+        pid: board_config::USB_PRODUCT_ID,
+        manufacturer: board_config::USB_MANUFACTURER,
+        product_name: board_config::USB_PRODUCT_NAME,
+        serial_number: board_config::USB_SERIAL_NUMBER,
     };
-    let vial_config = VialConfig::new(VIAL_KEYBOARD_ID, VIAL_KEYBOARD_DEF, UNLOCK_KEYS);
+    let vial_config = VialConfig::new(
+        VIAL_KEYBOARD_ID,
+        VIAL_KEYBOARD_DEF,
+        board_config::VIAL_UNLOCK_KEYS,
+    );
     let storage_config = StorageConfig {
-        start_addr: 0xA0000,
-        num_sectors: 6,
+        start_addr: board_config::STORAGE_START_ADDR,
+        num_sectors: board_config::STORAGE_NUM_SECTORS,
         ..Default::default()
     };
     let rmk_config = RmkConfig {

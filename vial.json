@@ -29,6 +29,11 @@
       "shortName": "BT3"
     },
     {
+      "name": "BT4",
+      "title": "Bluetooth Profile 4",
+      "shortName": "BT4"
+    },
+    {
       "name": "NEXT_BT",
       "title": "Switch to the next Bluetooth profile",
       "shortName": "Next\nBT"

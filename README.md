@@ -5,7 +5,7 @@
 ## 機能 (Features)
 
 - **Bluetooth & USB のデュアル接続**: `Seeed Studio XIAO nRF52840` 上で BLE と USB の両方を使えます。無線キーボードとして常用しつつ、USB 接続時は有線デバッグやファーム更新の導線も確保しています。
-- **4プロファイルのマルチペアリング**: BLE プロファイルを `4つ` 保持でき、PC・タブレット・スマホなど複数ホストを使い分けられます。`BT0` から `BT3` で特定スロットへ直接切り替え、`NEXT_BT` / `PREV_BT` で順送り、`CLR_BT` で現在スロットのボンド情報削除ができます。
+- **5プロファイルのマルチペアリング**: BLE プロファイルを `5つ` 保持でき、PC・タブレット・スマホなど複数ホストを使い分けられます。`BT0` から `BT4` で特定スロットへ直接切り替え、`NEXT_BT` / `PREV_BT` で順送り、`CLR_BT` で現在スロットのボンド情報削除ができます。`CLR_BT` と `SWITCH` はデフォルトキーマップに含まれないため、必要に応じて Vial から任意のレイヤーへ割り当ててください。
 - **Vial / VIA 対応**: ブラウザの Vial Web などから、ファームを書き直さずにキーマップを即時変更できます。BLE プロファイル切り替え系のカスタムキーコードも `vial.json` に定義済みで、必要に応じて任意レイヤーへ再配置できます。
 - **ステータス表示 LED（RGB LED Widget）**: XIAO BLE 本体のフルカラー LED で、起動直後のバッテリー残量、BLE の接続待ち、接続成立したプロファイル、USB 接続イベント、低バッテリー警告、スリープ状態を色と点滅パターンで表現します。
 - **省電力動作**: 打鍵が止まるとバッテリー測定周期と LED 表示を抑え、さらに長時間無操作なら deep sleep へ移行します。挙動の詳細は下の `Power Behavior` を参照してください。
@@ -17,10 +17,10 @@
 
 | 状態 | 色 | 点灯パターン | 意味 |
 | --- | --- | --- | --- |
-| 起動直後のバッテリー表示 | 緑 / 黄 / 赤 | 2秒間点灯 | 初回バッテリー測定結果を表示。`50%以上 = 緑`、`20〜49% = 黄`、`19%以下 = 赤` |
+| 起動直後のバッテリー表示 | 緑 / 黄 / 赤 | 1.2秒間点灯 | 初回バッテリー測定結果を表示。`50%以上 = 緑`、`20〜49% = 黄`、`19%以下 = 赤` |
 | BLE 接続待ち（Advertising） | プロファイル色 | `200ms` 点灯 + `800ms` 消灯の点滅 | 現在の BLE プロファイルでペアリング待ち・再接続待ちであることを表示 |
 | BLE 接続成立直後 | プロファイル色 | 3秒間点灯 | どのプロファイルで接続されたかを確認しやすくするための表示 |
-| USB 接続イベント | 白 | 2秒間点灯 | USB 側の接続変化を通知 |
+| USB 接続イベント | 白 | 1.2秒間点灯 | USB 側の接続変化を通知 |
 | 低バッテリー警告 | 赤 | 1.5秒間点灯後、`200ms` 点灯 + `800ms` 消灯の点滅 | バッテリー残量 `20%未満` の警告 |
 | スリープ中 | 消灯 | 常時消灯 | 省電力のため LED 表示を止める |
 | 通常待機中 | 消灯 | 常時消灯 | 接続済みで特別なイベントがない通常状態 |
@@ -31,10 +31,11 @@ BLE プロファイル色の対応は次の通りです。
 - `Profile 1`: 緑
 - `Profile 2`: 黄
 - `Profile 3`: 青
+- `Profile 4`: マゼンタ
 
 ## BLE プロファイル運用メモ
 
-- `keyboard.toml` で BLE プロファイル数を `4` に設定しています。
+- `keyboard.toml` で BLE プロファイル数を `5` に設定しています。
 - 1つのプロファイルは「1台のホストとのボンド情報」を持つスロットとして使います。
 - 既に別の機器と結びついているプロファイルへ新しい機器をつなぎたい場合は、先に `CLR_BT` で現在スロットのボンド情報を消すと切り替えがスムーズです。
 - `vial.json` には `SWITCH` も定義されているため、Vial 上で「USB / BLE のデフォルト出力をトグルするキー」を後から割り当てることもできます。
@@ -70,7 +71,7 @@ On Linux, you may also need the `probe-rs` udev rules before the probe becomes v
 
 ### For USB bootloader flashing
 
-This project already uses the Adafruit nRF52 bootloader layout in [memory.x](/home/satoyu/ドキュメント/git/kotsubu-firmware/kotsubu_firmware_rmk/memory.x#L4), so UF2 flashing is the easiest path if your board exposes a UF2 drive.
+This project already uses the Adafruit nRF52 bootloader layout in [memory.x](memory.x#L4), so UF2 flashing is the easiest path if your board exposes a UF2 drive.
 
 Install the helper tools once:
 
@@ -83,7 +84,7 @@ PATH="$HOME/.cargo/bin:$PATH" rustup component add llvm-tools
 
 ### 1. Flash with a debug probe
 
-`cargo run --release` uses the runner from [.cargo/config.toml](/home/satoyu/ドキュメント/git/kotsubu-firmware/kotsubu_firmware_rmk/.cargo/config.toml#L1) and writes directly with `probe-rs`.
+`cargo run --release` uses the runner from [.cargo/config.toml](.cargo/config.toml#L1) and writes directly with `probe-rs`.
 
 ```bash
 bash scripts/flash_probe.sh
@@ -116,7 +117,7 @@ Put the XIAO BLE into bootloader mode, wait for the UF2 USB drive to appear, the
 bash scripts/flash_uf2.sh
 ```
 
-The copy task uses [scripts/copy_uf2.sh](/home/satoyu/ドキュメント/git/kotsubu-firmware/kotsubu_firmware_rmk/scripts/copy_uf2.sh), which looks for a mounted drive containing `INFO_UF2.TXT`.
+The copy task uses [scripts/copy_uf2.sh](scripts/copy_uf2.sh), which looks for a mounted drive containing `INFO_UF2.TXT`.
 If normal reset is not enough, press the XIAO reset button twice quickly to enter bootloader mode.
 
 If you want to copy manually instead:
@@ -126,14 +127,14 @@ cp kotsubu-rmk.uf2 /path/to/UF2_DRIVE/
 sync
 ```
 
-If you prefer the RMK-style `cargo-make` task, [Makefile.toml](/home/satoyu/ドキュメント/git/kotsubu-firmware/kotsubu_firmware_rmk/Makefile.toml#L1) also provides `uf2`, `flash-probe`, and `flash-uf2`.
+If you prefer the RMK-style `cargo-make` task, [Makefile.toml](Makefile.toml#L1) also provides `uf2`, `flash-probe`, and `flash-uf2`.
 
 ## Bootloader Notes
 
 - This repository is currently configured for the Adafruit nRF52 UF2 bootloader layout:
   - `FLASH : ORIGIN = 0x00001000`
   - `RAM : ORIGIN = 0x20000008`
-- If you erase the bootloader and want to flash the board as raw nRF52840 over SWD, switch [memory.x](/home/satoyu/ドキュメント/git/kotsubu-firmware/kotsubu_firmware_rmk/memory.x#L8) to the non-bootloader values first.
+- If you erase the bootloader and want to flash the board as raw nRF52840 over SWD, switch [memory.x](memory.x#L8) to the non-bootloader values first.
 
 ## Quick Reference
 
@@ -152,5 +153,5 @@ bash scripts/flash_uf2.sh
 
 This project is licensed under either of the following, at your option:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](/home/satoyu/ドキュメント/git/kotsubu_firmware_rmk/LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](/home/satoyu/ドキュメント/git/kotsubu_firmware_rmk/LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))

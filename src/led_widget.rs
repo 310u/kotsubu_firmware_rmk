@@ -1,12 +1,16 @@
 use defmt::info;
 use embassy_nrf::gpio::Output;
 use embassy_time::{Duration, Instant, Timer};
+use rmk::ble::BLE_STATUS;
 use rmk::embassy_futures::select::{Either, select};
 use rmk::event::{
     BatteryStateEvent, BleStatusChangeEvent, ConnectionChangeEvent, ConnectionType,
     EventSubscriber, SleepStateEvent, SubscribableEvent,
 };
+use rmk::state::{ConnectionType as RuntimeConnectionType, get_connection_type};
 use rmk::types::ble::BleState;
+
+use crate::unified_policy::{self, LedColor};
 
 pub struct RgbLed<'a> {
     red: Output<'a>,
@@ -56,6 +60,85 @@ pub enum RgbEvent {
     SleepChange(SleepStateEvent),
 }
 
+fn show_temp_color(
+    temp_color_until: &mut Option<(Instant, LedColor)>,
+    duration: Duration,
+    color: LedColor,
+) {
+    *temp_color_until = Some((Instant::now() + duration, color));
+}
+
+async fn boot_self_test(led: &mut RgbLed<'_>) {
+    if !unified_policy::LED_BOOT_SELF_TEST_ENABLED {
+        return;
+    }
+
+    for color in [
+        unified_policy::LED_RED,
+        unified_policy::LED_GREEN,
+        unified_policy::LED_BLUE,
+    ] {
+        led.set_color(color.0, color.1, color.2);
+        Timer::after(Duration::from_millis(unified_policy::LED_SELF_TEST_STEP_MS)).await;
+    }
+    led.set_color(
+        unified_policy::LED_OFF.0,
+        unified_policy::LED_OFF.1,
+        unified_policy::LED_OFF.2,
+    );
+}
+
+fn apply_led_state(
+    led: &mut RgbLed<'_>,
+    temp_color_until: Option<(Instant, LedColor)>,
+    is_sleeping: bool,
+    is_adv: bool,
+    blink_state: bool,
+    bat_critical: bool,
+    current_profile: u8,
+) {
+    if is_sleeping {
+        led.set_color(
+            unified_policy::LED_OFF.0,
+            unified_policy::LED_OFF.1,
+            unified_policy::LED_OFF.2,
+        );
+    } else if let Some((_, color)) = temp_color_until {
+        led.set_color(color.0, color.1, color.2);
+    } else if is_adv {
+        if blink_state {
+            let pc = profile_color(current_profile);
+            led.set_color(pc.0, pc.1, pc.2);
+        } else {
+            led.set_color(
+                unified_policy::LED_OFF.0,
+                unified_policy::LED_OFF.1,
+                unified_policy::LED_OFF.2,
+            );
+        }
+    } else if bat_critical {
+        if blink_state {
+            led.set_color(
+                unified_policy::LED_RED.0,
+                unified_policy::LED_RED.1,
+                unified_policy::LED_RED.2,
+            );
+        } else {
+            led.set_color(
+                unified_policy::LED_OFF.0,
+                unified_policy::LED_OFF.1,
+                unified_policy::LED_OFF.2,
+            );
+        }
+    } else {
+        led.set_color(
+            unified_policy::LED_OFF.0,
+            unified_policy::LED_OFF.1,
+            unified_policy::LED_OFF.2,
+        );
+    }
+}
+
 #[embassy_executor::task]
 pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
     let mut conn_sub = ConnectionChangeEvent::subscriber();
@@ -65,22 +148,25 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
     let mut sleep_sub = SleepStateEvent::subscriber();
 
     // Turn off initially
-    led.set_color(false, false, false);
+    led.set_color(
+        unified_policy::LED_OFF.0,
+        unified_policy::LED_OFF.1,
+        unified_policy::LED_OFF.2,
+    );
+    boot_self_test(&mut led).await;
+
+    let mut temp_color_until: Option<(Instant, LedColor)> = None;
 
     // Initial sequence: wait up to 2 seconds for a battery event to show boot status
     if let Ok(bat) = embassy_time::with_timeout(Duration::from_secs(2), bat_sub.next_event()).await
     {
         if let Some(percentage) = get_bat_percentage(bat) {
             info!("Boot battery level: {}%", percentage);
-            if percentage >= 50 {
-                led.set_color(false, true, false); // Green
-            } else if percentage >= 20 {
-                led.set_color(true, true, false); // Yellow
-            } else {
-                led.set_color(true, false, false); // Red
-            }
-            Timer::after(Duration::from_millis(2000)).await;
-            led.set_color(false, false, false);
+            show_temp_color(
+                &mut temp_color_until,
+                Duration::from_millis(unified_policy::LED_BOOT_BATTERY_DISPLAY_MS),
+                unified_policy::boot_battery_color(percentage),
+            );
         } else {
             info!("Boot battery level: unknown yet");
         }
@@ -88,17 +174,28 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
         info!("No battery event received at boot within timeout");
     }
 
-    let mut is_adv = false;
-    let mut is_conn = false;
-    let mut current_profile = 0;
+    let initial_ble = BLE_STATUS.lock(|c| c.get());
+    let mut is_adv = initial_ble.state == BleState::Advertising;
+    let mut is_conn = initial_ble.state == BleState::Connected;
+    let mut current_profile = initial_ble.profile;
     let mut bat_critical = false;
     let mut is_sleeping = false;
+    let mut blink_state = is_adv;
+    let mut next_blink_time = if is_adv {
+        Instant::now() + Duration::from_millis(unified_policy::LED_BLINK_ON_MS)
+    } else {
+        Instant::now()
+    };
 
-    // Temporary override (e.g. for connection success)
-    let mut temp_color_until: Option<(Instant, (bool, bool, bool))> = None;
-
-    let mut blink_state = false;
-    let mut next_blink_time = Instant::now();
+    apply_led_state(
+        &mut led,
+        temp_color_until,
+        is_sleeping,
+        is_adv,
+        blink_state,
+        bat_critical,
+        current_profile,
+    );
 
     loop {
         // Calculate sleep timeout
@@ -142,12 +239,18 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
                     RgbEvent::ConnChange(conn) => {
                         let is_ble = conn.connection_type == ConnectionType::Ble;
                         info!("Conn change event: is_ble={}", is_ble);
-                        if !is_ble {
-                            // USB connected: show white briefly
-                            temp_color_until = Some((
-                                Instant::now() + Duration::from_millis(2000),
-                                (true, true, true), // White
-                            ));
+                        if is_ble {
+                            show_temp_color(
+                                &mut temp_color_until,
+                                Duration::from_millis(unified_policy::LED_STATUS_EVENT_DISPLAY_MS),
+                                profile_color(current_profile),
+                            );
+                        } else {
+                            show_temp_color(
+                                &mut temp_color_until,
+                                Duration::from_millis(unified_policy::LED_STATUS_EVENT_DISPLAY_MS),
+                                unified_policy::LED_WHITE,
+                            );
                         }
                     }
                     RgbEvent::BleStatusChange(ble) => {
@@ -155,46 +258,59 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
                             "BLE change event: profile={}, state={:?}",
                             ble.0.profile, ble.0.state
                         );
-                        // Profile changed? Show color
-                        if current_profile != ble.0.profile {
+                        let profile_changed = current_profile != ble.0.profile;
+                        if profile_changed {
                             current_profile = ble.0.profile;
+                            show_temp_color(
+                                &mut temp_color_until,
+                                Duration::from_millis(unified_policy::LED_STATUS_EVENT_DISPLAY_MS),
+                                profile_color(current_profile),
+                            );
                         }
 
                         is_adv = ble.0.state == BleState::Advertising;
 
                         let new_conn = ble.0.state == BleState::Connected;
                         if !is_conn && new_conn {
-                            // Just connected: show profile color for 3 secs
-                            temp_color_until = Some((
-                                Instant::now() + Duration::from_millis(3000),
+                            show_temp_color(
+                                &mut temp_color_until,
+                                Duration::from_millis(
+                                    unified_policy::LED_CONNECTION_SUCCESS_DISPLAY_MS,
+                                ),
                                 profile_color(current_profile),
-                            ));
+                            );
                         }
                         is_conn = new_conn;
 
                         if is_adv {
-                            next_blink_time = Instant::now(); // reset blink timer immediately
+                            blink_state = true;
+                            next_blink_time =
+                                Instant::now() + Duration::from_millis(unified_policy::LED_BLINK_ON_MS);
                         }
                     }
                     RgbEvent::BatChange(bat) => {
                         if let Some(percentage) = get_bat_percentage(bat) {
-                            let critical = percentage < 20;
+                            let critical = unified_policy::is_battery_critical(percentage);
                             if critical && !bat_critical {
-                                // Just entered critical: show red
-                                temp_color_until = Some((
-                                    Instant::now() + Duration::from_millis(1500),
-                                    (true, false, false), // Red
-                                ));
+                                show_temp_color(
+                                    &mut temp_color_until,
+                                    Duration::from_millis(
+                                        unified_policy::LED_LOW_BATTERY_DISPLAY_MS,
+                                    ),
+                                    unified_policy::LED_RED,
+                                );
                                 bat_critical = true;
                                 next_blink_time = Instant::now();
                             } else if !critical && bat_critical {
                                 bat_critical = false;
                             } else if critical {
-                                // critical state continued, just blink warning
-                                temp_color_until = Some((
-                                    Instant::now() + Duration::from_millis(1500),
-                                    (true, false, false), // Red
-                                ));
+                                show_temp_color(
+                                    &mut temp_color_until,
+                                    Duration::from_millis(
+                                        unified_policy::LED_LOW_BATTERY_DISPLAY_MS,
+                                    ),
+                                    unified_policy::LED_RED,
+                                );
                             }
                         }
                     }
@@ -219,46 +335,36 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
                 if temp_color_until.is_none() && (is_adv || bat_critical) {
                     if now >= next_blink_time {
                         blink_state = !blink_state;
-                        next_blink_time =
-                            now + Duration::from_millis(if blink_state { 200 } else { 800 });
+                        next_blink_time = now
+                            + Duration::from_millis(if blink_state {
+                                unified_policy::LED_BLINK_ON_MS
+                            } else {
+                                unified_policy::LED_BLINK_OFF_MS
+                            });
                     }
                 }
             }
         }
 
-        // Apply colors
-        if is_sleeping {
-            led.set_color(false, false, false);
-            continue;
-        }
-
-        if let Some((_, color)) = temp_color_until {
-            led.set_color(color.0, color.1, color.2);
-        } else if is_adv {
-            if blink_state {
-                let pc = profile_color(current_profile);
-                led.set_color(pc.0, pc.1, pc.2);
-            } else {
-                led.set_color(false, false, false);
-            }
-        } else if bat_critical {
-            if blink_state {
-                led.set_color(true, false, false); // Red
-            } else {
-                led.set_color(false, false, false);
-            }
-        } else {
-            led.set_color(false, false, false);
-        }
+        apply_led_state(
+            &mut led,
+            temp_color_until,
+            is_sleeping,
+            is_adv,
+            blink_state,
+            bat_critical,
+            current_profile,
+        );
     }
 }
 
 fn profile_color(profile: u8) -> (bool, bool, bool) {
-    match profile {
-        0 => (true, false, false), // Red
-        1 => (false, true, false), // Green
-        2 => (true, true, false),  // Yellow
-        3 => (false, false, true), // Blue
-        _ => (true, false, true),  // Magenta (fallback)
+    if let Some(color) = unified_policy::profile_color(profile) {
+        color
+    } else {
+        match get_connection_type() {
+            RuntimeConnectionType::Usb => unified_policy::LED_WHITE,
+            RuntimeConnectionType::Ble => unified_policy::LED_MAGENTA,
+        }
     }
 }

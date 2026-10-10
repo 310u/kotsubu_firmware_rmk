@@ -1,2 +1,7 @@
 [rmk]
-ble_profiles_num = 4
+ble_profiles_num = 5
+
+[ble]
+enabled = true
+passkey_entry = false
+passkey_entry_timeout = 120

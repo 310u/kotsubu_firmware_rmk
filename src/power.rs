@@ -7,13 +7,14 @@ use rmk::embassy_futures::select::{Either, select};
 use rmk::event::{SleepStateEvent, publish_event};
 use rmk::usb::is_usb_configured;
 
+use crate::unified_policy;
+
 pub const BATTERY_ACTIVE_INTERVAL_SECS: u64 = 10;
 pub const BATTERY_IDLE_INTERVAL_SECS: u64 = 60;
 pub const BATTERY_SLEEP_INTERVAL_SECS: u64 = 300;
 pub const BATTERY_IDLE_AFTER_SECS: u32 = 5;
 pub const SLEEP_TIMEOUT_SECS: u32 = 300;
-pub const DEEP_SLEEP_TIMEOUT_SECS: u32 = 1800;
-pub const DEEP_SLEEP_SKIP_WHEN_USB_CONFIGURED: bool = true;
+pub const DEEP_SLEEP_TIMEOUT_SECS: u32 = unified_policy::DEEP_SLEEP_TIMEOUT_SECS;
 
 pub static LAST_ACTIVITY_SEC: AtomicU32 = AtomicU32::new(0);
 pub static PRESSED_KEY_COUNT: AtomicU8 = AtomicU8::new(0);
@@ -69,13 +70,27 @@ pub fn battery_interval_secs() -> u64 {
 }
 
 pub fn should_enter_deep_sleep() -> bool {
-    pressed_keys() == 0
-        && idle_seconds() >= DEEP_SLEEP_TIMEOUT_SECS
-        && (!DEEP_SLEEP_SKIP_WHEN_USB_CONFIGURED || !is_usb_configured())
+    if unified_policy::DEEP_SLEEP_REQUIRES_SLEEP_STATE && !is_sleeping() {
+        return false;
+    }
+
+    if unified_policy::DEEP_SLEEP_SKIP_WHEN_USB_CONFIGURED && is_usb_configured() {
+        return false;
+    }
+
+    pressed_keys() == 0 && idle_seconds() >= DEEP_SLEEP_TIMEOUT_SECS
 }
 
 pub fn deep_sleep_wait_secs() -> Option<u64> {
-    if pressed_keys() > 0 || (DEEP_SLEEP_SKIP_WHEN_USB_CONFIGURED && is_usb_configured()) {
+    if pressed_keys() > 0 {
+        return None;
+    }
+
+    if unified_policy::DEEP_SLEEP_REQUIRES_SLEEP_STATE && !is_sleeping() {
+        return None;
+    }
+
+    if unified_policy::DEEP_SLEEP_SKIP_WHEN_USB_CONFIGURED && is_usb_configured() {
         return None;
     }
 
