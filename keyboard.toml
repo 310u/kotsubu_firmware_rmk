@@ -1,6 +1,27 @@
 [rmk]
 ble_profiles_num = 5
 
+# Event channel subscriber overrides.
+# Our tasks (led_widget, power/sleep_manager, battery status via ble service)
+# subscribe on top of RMK internals (rynk USB+BLE sessions), so the
+# event_default.toml base counts (conn=1, sleep=1, battery=0) overflow and
+# panic at ConnectionStatusChangeEvent::subscriber(). Counts cover worst case
+# USB + BLE both active plus our tasks, with one spare slot each.
+[event.connection_status_change]
+subs = 5
+
+[event.sleep_state]
+subs = 4
+
+[event.battery_status]
+subs = 5
+
+[event.layer_change]
+subs = 3
+
+[event.wpm_update]
+subs = 3
+
 [ble]
 enabled = true
 passkey_entry = false
