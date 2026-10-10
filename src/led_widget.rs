@@ -1,13 +1,12 @@
 use defmt::info;
 use embassy_nrf::gpio::Output;
 use embassy_time::{Duration, Instant, Timer};
-use rmk::ble::BLE_STATUS;
 use rmk::embassy_futures::select::{Either, select};
 use rmk::event::{
-    BatteryStateEvent, BleStatusChangeEvent, ConnectionChangeEvent, ConnectionType,
-    EventSubscriber, SleepStateEvent, SubscribableEvent,
+    BatteryStatusEvent, ConnectionStatusChangeEvent, ConnectionType, EventSubscriber,
+    SleepStateEvent, SubscribableEvent,
 };
-use rmk::state::{ConnectionType as RuntimeConnectionType, get_connection_type};
+use rmk::types::battery::BatteryStatus;
 use rmk::types::ble::BleState;
 
 use crate::unified_policy::{self, LedColor};
@@ -45,18 +44,16 @@ impl<'a> RgbLed<'a> {
     }
 }
 
-fn get_bat_percentage(bat: BatteryStateEvent) -> Option<u8> {
-    match bat {
-        BatteryStateEvent::Normal(p) => Some(p),
-        BatteryStateEvent::Charged => Some(100),
-        _ => None,
+fn get_bat_percentage(bat: BatteryStatusEvent) -> Option<u8> {
+    match bat.0 {
+        BatteryStatus::Available { level, .. } => level,
+        BatteryStatus::Unavailable => None,
     }
 }
 
 pub enum RgbEvent {
-    ConnChange(ConnectionChangeEvent),
-    BleStatusChange(BleStatusChangeEvent),
-    BatChange(BatteryStateEvent),
+    ConnChange(ConnectionStatusChangeEvent),
+    BatChange(BatteryStatusEvent),
     SleepChange(SleepStateEvent),
 }
 
@@ -141,10 +138,8 @@ fn apply_led_state(
 
 #[embassy_executor::task]
 pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
-    let mut conn_sub = ConnectionChangeEvent::subscriber();
-    //#[cfg(feature = "_ble")]
-    let mut ble_sub = BleStatusChangeEvent::subscriber();
-    let mut bat_sub = BatteryStateEvent::subscriber();
+    let mut conn_sub = ConnectionStatusChangeEvent::subscriber();
+    let mut bat_sub = BatteryStatusEvent::subscriber();
     let mut sleep_sub = SleepStateEvent::subscriber();
 
     // Turn off initially
@@ -174,18 +169,14 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
         info!("No battery event received at boot within timeout");
     }
 
-    let initial_ble = BLE_STATUS.lock(|c| c.get());
-    let mut is_adv = initial_ble.state == BleState::Advertising;
-    let mut is_conn = initial_ble.state == BleState::Connected;
-    let mut current_profile = initial_ble.profile;
+    let mut is_adv = false;
+    let mut is_conn = false;
+    let mut current_profile = 0u8;
+    let mut last_active: Option<ConnectionType> = None;
     let mut bat_critical = false;
     let mut is_sleeping = false;
-    let mut blink_state = is_adv;
-    let mut next_blink_time = if is_adv {
-        Instant::now() + Duration::from_millis(unified_policy::LED_BLINK_ON_MS)
-    } else {
-        Instant::now()
-    };
+    let mut blink_state = false;
+    let mut next_blink_time = Instant::now();
 
     apply_led_state(
         &mut led,
@@ -221,108 +212,95 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
         let t_fut = Timer::after(timeout);
         let ev_fut = async {
             match select(
-                select(conn_sub.next_event(), ble_sub.next_event()),
-                select(bat_sub.next_event(), sleep_sub.next_event()),
+                select(conn_sub.next_event(), bat_sub.next_event()),
+                sleep_sub.next_event(),
             )
             .await
             {
                 Either::First(Either::First(conn)) => RgbEvent::ConnChange(conn),
-                Either::First(Either::Second(ble)) => RgbEvent::BleStatusChange(ble),
-                Either::Second(Either::First(bat)) => RgbEvent::BatChange(bat),
-                Either::Second(Either::Second(sleep)) => RgbEvent::SleepChange(sleep),
+                Either::First(Either::Second(bat)) => RgbEvent::BatChange(bat),
+                Either::Second(sleep) => RgbEvent::SleepChange(sleep),
             }
         };
 
         match select(ev_fut, t_fut).await {
-            Either::First(event) => {
-                match event {
-                    RgbEvent::ConnChange(conn) => {
-                        let is_ble = conn.connection_type == ConnectionType::Ble;
-                        info!("Conn change event: is_ble={}", is_ble);
-                        if is_ble {
-                            show_temp_color(
-                                &mut temp_color_until,
-                                Duration::from_millis(unified_policy::LED_STATUS_EVENT_DISPLAY_MS),
-                                profile_color(current_profile),
-                            );
-                        } else {
-                            show_temp_color(
-                                &mut temp_color_until,
-                                Duration::from_millis(unified_policy::LED_STATUS_EVENT_DISPLAY_MS),
-                                unified_policy::LED_WHITE,
-                            );
-                        }
-                    }
-                    RgbEvent::BleStatusChange(ble) => {
-                        info!(
-                            "BLE change event: profile={}, state={:?}",
-                            ble.0.profile, ble.0.state
+            Either::First(event) => match event {
+                RgbEvent::ConnChange(conn) => {
+                    let status = conn.0;
+                    info!(
+                        "Connection status change: usb={:?}, ble={:?}",
+                        status.usb, status.ble
+                    );
+
+                    if status.ble.profile != current_profile {
+                        current_profile = status.ble.profile;
+                        show_temp_color(
+                            &mut temp_color_until,
+                            Duration::from_millis(unified_policy::LED_STATUS_EVENT_DISPLAY_MS),
+                            profile_color(current_profile),
                         );
-                        let profile_changed = current_profile != ble.0.profile;
-                        if profile_changed {
-                            current_profile = ble.0.profile;
+                    }
+
+                    let new_conn = status.ble.state == BleState::Connected;
+                    if !is_conn && new_conn {
+                        show_temp_color(
+                            &mut temp_color_until,
+                            Duration::from_millis(
+                                unified_policy::LED_CONNECTION_SUCCESS_DISPLAY_MS,
+                            ),
+                            profile_color(current_profile),
+                        );
+                    }
+                    is_conn = new_conn;
+
+                    let active = status.decide_active();
+                    if active != last_active && active == Some(ConnectionType::Usb) {
+                        show_temp_color(
+                            &mut temp_color_until,
+                            Duration::from_millis(unified_policy::LED_STATUS_EVENT_DISPLAY_MS),
+                            unified_policy::LED_WHITE,
+                        );
+                    }
+                    last_active = active;
+
+                    let was_adv = is_adv;
+                    is_adv = status.ble.state == BleState::Advertising;
+                    if is_adv && !was_adv {
+                        blink_state = true;
+                        next_blink_time =
+                            Instant::now() + Duration::from_millis(unified_policy::LED_BLINK_ON_MS);
+                    }
+                }
+                RgbEvent::BatChange(bat) => {
+                    if let Some(percentage) = get_bat_percentage(bat) {
+                        let critical = unified_policy::is_battery_critical(percentage);
+                        if critical && !bat_critical {
                             show_temp_color(
                                 &mut temp_color_until,
-                                Duration::from_millis(unified_policy::LED_STATUS_EVENT_DISPLAY_MS),
-                                profile_color(current_profile),
+                                Duration::from_millis(unified_policy::LED_LOW_BATTERY_DISPLAY_MS),
+                                unified_policy::LED_RED,
                             );
-                        }
-
-                        is_adv = ble.0.state == BleState::Advertising;
-
-                        let new_conn = ble.0.state == BleState::Connected;
-                        if !is_conn && new_conn {
+                            bat_critical = true;
+                            next_blink_time = Instant::now();
+                        } else if !critical && bat_critical {
+                            bat_critical = false;
+                        } else if critical {
                             show_temp_color(
                                 &mut temp_color_until,
-                                Duration::from_millis(
-                                    unified_policy::LED_CONNECTION_SUCCESS_DISPLAY_MS,
-                                ),
-                                profile_color(current_profile),
+                                Duration::from_millis(unified_policy::LED_LOW_BATTERY_DISPLAY_MS),
+                                unified_policy::LED_RED,
                             );
-                        }
-                        is_conn = new_conn;
-
-                        if is_adv {
-                            blink_state = true;
-                            next_blink_time =
-                                Instant::now() + Duration::from_millis(unified_policy::LED_BLINK_ON_MS);
-                        }
-                    }
-                    RgbEvent::BatChange(bat) => {
-                        if let Some(percentage) = get_bat_percentage(bat) {
-                            let critical = unified_policy::is_battery_critical(percentage);
-                            if critical && !bat_critical {
-                                show_temp_color(
-                                    &mut temp_color_until,
-                                    Duration::from_millis(
-                                        unified_policy::LED_LOW_BATTERY_DISPLAY_MS,
-                                    ),
-                                    unified_policy::LED_RED,
-                                );
-                                bat_critical = true;
-                                next_blink_time = Instant::now();
-                            } else if !critical && bat_critical {
-                                bat_critical = false;
-                            } else if critical {
-                                show_temp_color(
-                                    &mut temp_color_until,
-                                    Duration::from_millis(
-                                        unified_policy::LED_LOW_BATTERY_DISPLAY_MS,
-                                    ),
-                                    unified_policy::LED_RED,
-                                );
-                            }
-                        }
-                    }
-                    RgbEvent::SleepChange(sleep) => {
-                        is_sleeping = sleep.sleeping;
-                        if is_sleeping {
-                            temp_color_until = None;
-                            blink_state = false;
                         }
                     }
                 }
-            }
+                RgbEvent::SleepChange(sleep) => {
+                    is_sleeping = sleep.0;
+                    if is_sleeping {
+                        temp_color_until = None;
+                        blink_state = false;
+                    }
+                }
+            },
             Either::Second(_) => {
                 // Timer tick
                 let now = Instant::now();
@@ -359,12 +337,5 @@ pub async fn rgb_widget_task(mut led: RgbLed<'static>) {
 }
 
 fn profile_color(profile: u8) -> (bool, bool, bool) {
-    if let Some(color) = unified_policy::profile_color(profile) {
-        color
-    } else {
-        match get_connection_type() {
-            RuntimeConnectionType::Usb => unified_policy::LED_WHITE,
-            RuntimeConnectionType::Ble => unified_policy::LED_MAGENTA,
-        }
-    }
+    unified_policy::profile_color(profile).unwrap_or(unified_policy::LED_WHITE)
 }

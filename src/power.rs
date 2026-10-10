@@ -3,9 +3,11 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::watch::Watch;
 use embassy_time::{Instant, Timer};
-use rmk::embassy_futures::select::{Either, select};
-use rmk::event::{SleepStateEvent, publish_event};
-use rmk::usb::is_usb_configured;
+use rmk::embassy_futures::select::{Either, Either3, select, select3};
+use rmk::event::{
+    ConnectionStatusChangeEvent, EventSubscriber, SleepStateEvent, SubscribableEvent, publish_event,
+};
+use rmk::types::connection::UsbState;
 
 use crate::unified_policy;
 
@@ -19,6 +21,7 @@ pub const DEEP_SLEEP_TIMEOUT_SECS: u32 = unified_policy::DEEP_SLEEP_TIMEOUT_SECS
 pub static LAST_ACTIVITY_SEC: AtomicU32 = AtomicU32::new(0);
 pub static PRESSED_KEY_COUNT: AtomicU8 = AtomicU8::new(0);
 pub static SLEEPING: AtomicBool = AtomicBool::new(false);
+pub static USB_CONFIGURED: AtomicBool = AtomicBool::new(false);
 pub static ACTIVITY_WATCH: Watch<ThreadModeRawMutex, u32, 2> = Watch::new();
 
 #[inline]
@@ -57,6 +60,17 @@ pub fn idle_seconds() -> u32 {
 
 pub fn is_sleeping() -> bool {
     SLEEPING.load(Ordering::Acquire)
+}
+
+fn is_usb_configured() -> bool {
+    USB_CONFIGURED.load(Ordering::Acquire)
+}
+
+fn update_usb_status(event: ConnectionStatusChangeEvent) {
+    USB_CONFIGURED.store(
+        matches!(event.0.usb, UsbState::Configured | UsbState::Suspended),
+        Ordering::Release,
+    );
 }
 
 pub fn battery_interval_secs() -> u64 {
@@ -104,32 +118,47 @@ pub fn deep_sleep_wait_secs() -> Option<u64> {
 
 pub async fn sleep_manager_task() -> ! {
     let mut activity_rx = ACTIVITY_WATCH.receiver().unwrap();
+    let mut conn_sub = ConnectionStatusChangeEvent::subscriber();
 
     loop {
         if is_sleeping() {
-            activity_rx.changed().await;
-            if SLEEPING.swap(false, Ordering::AcqRel) {
-                publish_event(SleepStateEvent { sleeping: false });
+            match select(activity_rx.changed(), conn_sub.next_event()).await {
+                Either::First(_) => {
+                    if SLEEPING.swap(false, Ordering::AcqRel) {
+                        publish_event(SleepStateEvent(false));
+                    }
+                }
+                Either::Second(event) => update_usb_status(event),
             }
             continue;
         }
 
         if pressed_keys() > 0 {
-            activity_rx.changed().await;
+            match select(activity_rx.changed(), conn_sub.next_event()).await {
+                Either::First(_) => {}
+                Either::Second(event) => update_usb_status(event),
+            }
             continue;
         }
 
         let idle = idle_seconds();
         if idle >= SLEEP_TIMEOUT_SECS {
             if !SLEEPING.swap(true, Ordering::AcqRel) {
-                publish_event(SleepStateEvent { sleeping: true });
+                publish_event(SleepStateEvent(true));
             }
             continue;
         }
 
         let wait_secs = u64::from(SLEEP_TIMEOUT_SECS - idle);
-        match select(Timer::after_secs(wait_secs), activity_rx.changed()).await {
-            Either::First(_) | Either::Second(_) => {}
+        match select3(
+            Timer::after_secs(wait_secs),
+            activity_rx.changed(),
+            conn_sub.next_event(),
+        )
+        .await
+        {
+            Either3::Third(event) => update_usb_status(event),
+            Either3::First(_) | Either3::Second(_) => {}
         }
     }
 }

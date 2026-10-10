@@ -1,8 +1,9 @@
 use embassy_time::Duration;
-use rmk::combo::{Combo, ComboConfig};
 use rmk::config::{BehaviorConfig, CombosConfig, Hand, MorsesConfig, PositionalConfig};
-use rmk::types::action::{KeyAction, MorseMode, MorseProfile};
+use rmk::keyboard::combo::{Combo, ComboConfig};
+use rmk::types::action::KeyAction;
 use rmk::types::modifier::ModifierCombination;
+use rmk::types::morse::{MorseMode, MorseProfile};
 use rmk::{a, k, kbctrl, layer, ltp, mo, mtp, shifted, user};
 
 pub const ROW: usize = 4;
@@ -12,21 +13,23 @@ pub const NUM_LAYER: usize = 4;
 const BASE: u8 = 0;
 const LOWER: u8 = 1;
 
+const HOME_ROW_PROFILE_INDEX: u8 = 0;
+const THUMB_PROFILE_INDEX: u8 = 1;
+
 const HOME_ROW_PROFILE: MorseProfile =
     MorseProfile::new(Some(true), Some(MorseMode::Normal), None, None);
-const THUMB_PROFILE: MorseProfile =
-    MorseProfile::new(None, Some(MorseMode::Normal), None, None);
+const THUMB_PROFILE: MorseProfile = MorseProfile::new(None, Some(MorseMode::Normal), None, None);
 
-const HRM_A: KeyAction = mtp!(A, ModifierCombination::LCTRL, HOME_ROW_PROFILE);
-const HRM_Z: KeyAction = mtp!(Z, ModifierCombination::LSHIFT, HOME_ROW_PROFILE);
-const HRM_X: KeyAction = mtp!(X, ModifierCombination::LGUI, HOME_ROW_PROFILE);
-const HRM_C: KeyAction = mtp!(C, ModifierCombination::LALT, HOME_ROW_PROFILE);
-const HRM_COMMA: KeyAction = mtp!(Comma, ModifierCombination::RALT, HOME_ROW_PROFILE);
-const HRM_DOT: KeyAction = mtp!(Dot, ModifierCombination::RCTRL, HOME_ROW_PROFILE);
-const HRM_SLASH: KeyAction = mtp!(Slash, ModifierCombination::RSHIFT, HOME_ROW_PROFILE);
+const HRM_A: KeyAction = mtp!(A, ModifierCombination::LCTRL, HOME_ROW_PROFILE_INDEX);
+const HRM_Z: KeyAction = mtp!(Z, ModifierCombination::LSHIFT, HOME_ROW_PROFILE_INDEX);
+const HRM_X: KeyAction = mtp!(X, ModifierCombination::LGUI, HOME_ROW_PROFILE_INDEX);
+const HRM_C: KeyAction = mtp!(C, ModifierCombination::LALT, HOME_ROW_PROFILE_INDEX);
+const HRM_COMMA: KeyAction = mtp!(Comma, ModifierCombination::RALT, HOME_ROW_PROFILE_INDEX);
+const HRM_DOT: KeyAction = mtp!(Dot, ModifierCombination::RCTRL, HOME_ROW_PROFILE_INDEX);
+const HRM_SLASH: KeyAction = mtp!(Slash, ModifierCombination::RSHIFT, HOME_ROW_PROFILE_INDEX);
 
-const LT_SPACE: KeyAction = ltp!(1, Space, THUMB_PROFILE);
-const LT_BSPC: KeyAction = ltp!(2, Backspace, THUMB_PROFILE);
+const LT_SPACE: KeyAction = ltp!(1, Space, THUMB_PROFILE_INDEX);
+const LT_BSPC: KeyAction = ltp!(2, Backspace, THUMB_PROFILE_INDEX);
 
 #[rustfmt::skip]
 pub const fn get_default_keymap() -> [[[KeyAction; COL]; ROW]; NUM_LAYER] {
@@ -104,10 +107,17 @@ pub fn get_behavior_config() -> BehaviorConfig {
                 ))),
             ],
             timeout: Duration::from_millis(150),
+            prior_idle_time: None,
         },
         morse: MorsesConfig {
             enable_flow_tap: true,
             prior_idle_time: Duration::from_millis(150),
+            profiles: {
+                let mut profiles = rmk::heapless::Vec::new();
+                _ = profiles.push(HOME_ROW_PROFILE);
+                _ = profiles.push(THUMB_PROFILE);
+                profiles
+            },
             ..Default::default()
         },
         ..Default::default()

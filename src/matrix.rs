@@ -6,11 +6,11 @@ use embassy_nrf::peripherals::{P0_02, P0_03, P0_04, P0_05, P0_28, P0_29, P1_12};
 use embassy_nrf::power as nrf_power;
 use embassy_nrf::spim;
 use embassy_time::{Duration, Instant, Timer};
+use rmk::core_traits::Runnable;
 use rmk::debounce::default_debouncer::DefaultDebouncer;
 use rmk::debounce::{DebounceState, DebouncerTrait};
 use rmk::embassy_futures::select::{Either5, select4, select5};
 use rmk::event::{KeyboardEvent, publish_event_async};
-use rmk::input_device::Runnable;
 use rmk::matrix::KeyState;
 
 use crate::power;
@@ -212,14 +212,14 @@ impl KotsubuMatrix {
             let pin = usize::from(pin_port % 32);
             match pin_port / 32 {
                 0 => pac::P0.pin_cnf(pin).modify(|w| {
-                    w.set_input(GpioInput::CONNECT);
-                    w.set_pull(GpioPull::PULLDOWN);
-                    w.set_sense(Sense::HIGH);
+                    w.set_input(GpioInput::Connect);
+                    w.set_pull(GpioPull::Pulldown);
+                    w.set_sense(Sense::High);
                 }),
                 1 => pac::P1.pin_cnf(pin).modify(|w| {
-                    w.set_input(GpioInput::CONNECT);
-                    w.set_pull(GpioPull::PULLDOWN);
-                    w.set_sense(Sense::HIGH);
+                    w.set_input(GpioInput::Connect);
+                    w.set_pull(GpioPull::Pulldown);
+                    w.set_sense(Sense::High);
                 }),
                 _ => {}
             }

@@ -27,16 +27,16 @@ use nrf_mpsl::Flash;
 use nrf_sdc::mpsl::MultiprotocolServiceLayer;
 use nrf_sdc::{self as sdc, mpsl};
 use panic_probe as _;
-use rand_chacha::ChaCha12Rng;
-use rand_core::SeedableRng;
-use rmk::ble::build_ble_stack;
+use rmk::ble::BleTransport;
 use rmk::config::{BleBatteryConfig, DeviceConfig, RmkConfig, StorageConfig, VialConfig};
-use rmk::embassy_futures::join::{join, join3};
 use rmk::embassy_futures::select::{Either, select};
-use rmk::event::{BatteryStateEvent, publish_event};
-use rmk::input_device::Runnable;
+use rmk::event::{BatteryStatusEvent, publish_event};
+use rmk::host::HostService;
 use rmk::keyboard::Keyboard;
-use rmk::{HostResources, KeymapData, initialize_keymap_and_storage, run_rmk};
+use rmk::types::battery::{BatteryStatus, ChargeState};
+use rmk::usb::UsbTransport;
+use rmk::watchdog::Nrf52Watchdog;
+use rmk::{KeymapData, initialize_keymap_and_storage, run_all};
 use static_cell::StaticCell;
 use vial::{VIAL_KEYBOARD_DEF, VIAL_KEYBOARD_ID};
 
@@ -55,6 +55,39 @@ bind_interrupts!(struct Irqs {
 #[embassy_executor::task]
 async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
     mpsl.run().await
+}
+
+#[embassy_executor::task]
+async fn sleep_manager() -> ! {
+    power::sleep_manager_task().await
+}
+
+#[embassy_executor::task]
+async fn battery_manager(mut batt_enable: Output<'static>, mut saadc: Saadc<'static, 1>) -> ! {
+    let mut activity_rx = power::ACTIVITY_WATCH.receiver().unwrap();
+    let mut sample_buf = [0i16; 1];
+    loop {
+        batt_enable.set_low();
+        Timer::after_micros(50).await;
+        saadc.sample(&mut sample_buf).await;
+        batt_enable.set_high();
+
+        let percent = battery_percent_from_adc(sample_buf[0] as u16);
+        publish_event(BatteryStatusEvent(BatteryStatus::Available {
+            charge_state: ChargeState::Unknown,
+            level: Some(percent),
+        }));
+
+        let wait_secs = power::battery_interval_secs();
+        if wait_secs == power::BATTERY_ACTIVE_INTERVAL_SECS {
+            Timer::after_secs(wait_secs).await;
+        } else {
+            match select(Timer::after_secs(wait_secs), activity_rx.changed()).await {
+                Either::First(_) => {}
+                Either::Second(_) => continue,
+            }
+        }
+    }
 }
 
 const L2CAP_TXQ: u8 = 3;
@@ -157,11 +190,8 @@ async fn main(spawner: Spawner) {
         p.PPI_CH25, p.PPI_CH26, p.PPI_CH27, p.PPI_CH28, p.PPI_CH29,
     );
     let mut rng = rng::Rng::new(p.RNG, Irqs);
-    let mut rng_gen = ChaCha12Rng::from_rng(&mut rng).unwrap();
-    let mut sdc_mem = sdc::Mem::<4096>::new();
+    let mut sdc_mem = sdc::Mem::<4696>::new();
     let sdc = unwrap!(build_sdc(sdc_p, &mut rng, mpsl, &mut sdc_mem));
-    let mut host_resources = HostResources::new();
-    let stack = build_ble_stack(sdc, ble_addr(), &mut rng_gen, &mut host_resources).await;
 
     let driver = Driver::new(p.USBD, Irqs, HardwareVbusDetect::new(Irqs));
     let flash = Flash::take(mpsl, p.NVMC);
@@ -170,7 +200,7 @@ async fn main(spawner: Spawner) {
     // Keep P0.14 High (disabled) during calibration to avoid driving the ADC pin
     let mut batt_enable = Output::new(p.P0_14, Level::High, OutputDrive::Standard);
     let adc_pin = p.P0_31.degrade_saadc();
-    let mut saadc = init_adc(adc_pin, p.SAADC);
+    let saadc = init_adc(adc_pin, p.SAADC);
     saadc.calibrate().await; // Wait for ADC calibration
 
     // Leave the voltage divider disabled until a sample is requested.
@@ -240,38 +270,23 @@ async fn main(spawner: Spawner) {
         ),
     );
     spawner.spawn(unwrap!(rgb_widget_task(rgb_led)));
+    spawner.spawn(unwrap!(sleep_manager()));
+    spawner.spawn(unwrap!(battery_manager(batt_enable, saadc)));
 
-    let mut activity_rx = power::ACTIVITY_WATCH.receiver().unwrap();
-    let battery_task = async move {
-        let mut sample_buf = [0i16; 1];
-        loop {
-            batt_enable.set_low();
-            Timer::after_micros(50).await;
-            saadc.sample(&mut sample_buf).await;
-            batt_enable.set_high();
+    let host_service = HostService::new(&keymap, &rmk_config);
+    let mut usb_transport =
+        UsbTransport::new(driver, rmk_config.device_config).with_host_service(&host_service);
+    let mut ble_transport =
+        BleTransport::new(sdc, ble_addr(), rmk_config).with_host_service(&host_service);
+    let mut watchdog_runner = Nrf52Watchdog::default_runner(p.WDT);
 
-            let percent = battery_percent_from_adc(sample_buf[0] as u16);
-            publish_event(BatteryStateEvent::Normal(percent));
-
-            let wait_secs = power::battery_interval_secs();
-            if wait_secs == power::BATTERY_ACTIVE_INTERVAL_SECS {
-                Timer::after_secs(wait_secs).await;
-            } else {
-                match select(Timer::after_secs(wait_secs), activity_rx.changed()).await {
-                    Either::First(_) => {}
-                    Either::Second(_) => continue,
-                }
-            }
-        }
-    };
-
-    join3(
-        matrix.run(),
-        join(power::sleep_manager_task(), battery_task),
-        join(
-            keyboard.run(),
-            run_rmk(&keymap, driver, &stack, &mut storage, rmk_config),
-        ),
+    run_all!(
+        matrix,
+        storage,
+        usb_transport,
+        ble_transport,
+        keyboard,
+        watchdog_runner
     )
     .await;
 }

@@ -39,6 +39,7 @@ BLE プロファイル色の対応は次の通りです。
 - 1つのプロファイルは「1台のホストとのボンド情報」を持つスロットとして使います。
 - 既に別の機器と結びついているプロファイルへ新しい機器をつなぎたい場合は、先に `CLR_BT` で現在スロットのボンド情報を消すと切り替えがスムーズです。
 - `vial.json` には `SWITCH` も定義されているため、Vial 上で「USB / BLE のデフォルト出力をトグルするキー」を後から割り当てることもできます。
+- RMK 0.9.0 への更新で BLE の HID レポート ID 再採番が入ったため、**更新後に既存ホストと再ペアが必要**です。ホスト側でこのキーボードのペアリング情報を削除してからペアリングし直してください（各プロファイルのスロット割り当て自体は変わりません）。
 
 ## Power Behavior
 
@@ -57,6 +58,13 @@ BLE プロファイル色の対応は次の通りです。
 
 ```bash
 PATH="$HOME/.cargo/bin:$PATH" rustup target add thumbv7em-none-eabihf
+```
+
+RMK 0.9.0 の BLE セキュリティ実装（`p256-cortex-m4`）をコンパイルするため、`arm-none-eabi-gcc`（Arm GNU Toolchain）が必要です。CI と同じ `gcc-arm-none-eabi` を入れてください（Windows は [Arm GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads) の zip 版を展開して `bin` を PATH に追加すると `arm-none-eabi-gcc` が使えます）。
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install -y gcc-arm-none-eabi
 ```
 
 ### For debug-probe flashing

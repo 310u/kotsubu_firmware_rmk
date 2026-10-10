@@ -58,7 +58,12 @@ fn main() {
 fn validate_unified_policy() {
     let keyboard_toml = fs::read_to_string("keyboard.toml").expect("Cannot read keyboard.toml");
     let expected_profiles = unified_policy::BLE_PROFILE_COUNT.to_string();
-    assert_toml_value(&keyboard_toml, "rmk", "ble_profiles_num", &expected_profiles);
+    assert_toml_value(
+        &keyboard_toml,
+        "rmk",
+        "ble_profiles_num",
+        &expected_profiles,
+    );
     assert_toml_value(&keyboard_toml, "ble", "enabled", "true");
     assert_toml_value(
         &keyboard_toml,
