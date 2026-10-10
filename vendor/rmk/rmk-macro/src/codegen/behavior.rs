@@ -2,13 +2,18 @@
 //!
 use std::collections::HashMap;
 
-use quote::quote;
+use quote::{format_ident, quote};
 use rmk_config::resolved::Behavior;
 use rmk_config::resolved::behavior::{
-    Combos, Forks, MacroOperation, Macros, Morse, MorseActionPair, MorseKey, MorseProfile, OneShot,
+    AutoMouseLayer, Combos, Forks, MacroOperation, Macros, Morse, MorseActionPair, MorseKey,
+    MorseProfile, OneShot,
 };
 
-use super::action_parser::{expand_profile, expand_profile_name, get_key_with_alias, parse_key};
+use super::action_parser::{
+    SetterTable, as_hid_keycode, expand_profile, expand_profile_name, get_key_with_alias,
+    parse_action, parse_key, parse_name_list, sorted_profile_names,
+};
+use super::feature::{get_rmk_features, is_feature_enabled};
 
 fn expand_tri_layer(tri_layer: &Option<[u8; 3]>) -> proc_macro2::TokenStream {
     match tri_layer {
@@ -47,10 +52,15 @@ fn expand_one_shot_modifiers(one_shot_modifiers: &Option<OneShot>) -> proc_macro
                 Some(value) => quote! { activate_on_keypress: #value, },
                 None => quote! {},
             };
+            let quick_release = match one_shot_modifier.quick_release {
+                Some(value) => quote! { quick_release: #value, },
+                None => quote! {},
+            };
 
             quote! {
                 ::rmk::config::OneShotModifiersConfig {
                     #activate_on_keypress
+                    #quick_release
                     ..Default::default()
                 }
             }
@@ -75,7 +85,7 @@ fn expand_morse_action_pair(
         }
     }
     let action = parse_key(action_pair.action.to_owned(), profiles);
-    quote! { (rmk::morse::MorsePattern::from_u16(#pattern), #action.to_action()) }
+    quote! { (rmk::types::morse::MorsePattern::from_u16(#pattern), #action.to_action()) }
 }
 
 fn expand_morse_actions(
@@ -112,11 +122,35 @@ fn expand_morse(morse: &Option<Morse>) -> proc_macro2::TokenStream {
         };
         let morses = expand_morses(&config.morses, &profiles_ref);
 
+        // Interned morse profile table, in the same sorted-name order used by
+        // `morse_profile` when it emits per-key indices. The pushes can't overflow:
+        // the profile count is validated against the capacity in `behavior()`.
+        let profile_names = sorted_profile_names(&profiles_ref);
+        let profiles_token = if profile_names.is_empty() {
+            quote! {}
+        } else {
+            let profile_tokens = profile_names.into_iter().map(|name| {
+                let profile = profiles_ref
+                    .as_ref()
+                    .and_then(|m| m.get(&name))
+                    .expect("name from same map");
+                expand_profile(profile)
+            });
+            quote! {
+                profiles: {
+                    let mut v = ::rmk::heapless::Vec::new();
+                    #( let _ = v.push(#profile_tokens); )*
+                    v
+                },
+            }
+        };
+
         quote! {
             ::rmk::config::MorsesConfig {
                 #enable_flow_tap_token
                 #prior_idle_time_token
                 default_profile: #default_profile,
+                #profiles_token
                 #morses
                 ..Default::default()
             }
@@ -133,16 +167,6 @@ fn expand_combos(
     let default = quote! { ::core::default::Default::default() };
     match combos {
         Some(combos) => {
-            let combos_def = combos.combos.iter().map(|combo| {
-                let actions = combo.actions.iter().map(|a| parse_key(a.to_owned(), profiles));
-                let output = parse_key(combo.output.to_owned(), profiles);
-                let layer = match combo.layer {
-                    Some(layer) => quote! { ::core::option::Option::Some(#layer) },
-                    None => quote! { ::core::option::Option::None },
-                };
-                quote! { ::rmk::combo::Combo::new(::rmk::combo::ComboConfig::new([#(#actions),*], #output, #layer)) }
-            });
-
             let timeout = match &combos.timeout_ms {
                 Some(millis) => {
                     quote! { timeout: ::embassy_time::Duration::from_millis(#millis), }
@@ -150,19 +174,49 @@ fn expand_combos(
                 None => quote! {},
             };
 
-            quote! {
-                ::rmk::config::CombosConfig {
+            let prior_idle_time = match &combos.prior_idle_time_ms {
+                Some(millis) => {
+                    quote! { prior_idle_time: ::core::option::Option::Some(::embassy_time::Duration::from_millis(#millis)), }
+                }
+                None => quote! {},
+            };
+
+            // When no combos are defined the `let v = [#(#combos_def),*]` expression
+            // collapses to `let v = []`, which Rust can't type-infer. Emit an
+            // all-`None` array directly in that case.
+            let combos_field = if combos.combos.is_empty() {
+                quote! {
+                    combos: core::array::from_fn(|_| ::core::option::Option::None),
+                }
+            } else {
+                let combos_def = combos.combos.iter().map(|combo| {
+                    let actions = combo.actions.iter().map(|a| parse_key(a.to_owned(), profiles));
+                    let output = parse_key(combo.output.to_owned(), profiles);
+                    let layer = match combo.layer {
+                        Some(layer) => quote! { ::core::option::Option::Some(#layer) },
+                        None => quote! { ::core::option::Option::None },
+                    };
+                    quote! { ::rmk::keyboard::combo::Combo::new(::rmk::keyboard::combo::ComboConfig::new([#(#actions),*], #output, #layer)) }
+                });
+                quote! {
                     combos: {
                         let v = [#(#combos_def),*];
                         core::array::from_fn(|i| {
                             if i < v.len() {
-                                Some(v[i])
+                                Some(v[i].clone())
                             } else {
                                 None
                             }
                         })
                     },
+                }
+            };
+
+            quote! {
+                ::rmk::config::CombosConfig {
+                    #combos_field
                     #timeout
+                    #prior_idle_time
                     ..Default::default()
                 }
             }
@@ -171,27 +225,51 @@ fn expand_combos(
     }
 }
 
+/// One key-carrying macro operation. A plain keycode takes the compact 3-byte
+/// encoding; a richer action (`WM(A, LCtrl)`, `PDF(1)`, `MACRO(0)`) takes Vial's
+/// 4-byte extended form, which is decoded through the Vial keycode table and so
+/// needs the `vial` feature.
+fn expand_macro_key(key: &str, compact: &str, extended: &str) -> proc_macro2::TokenStream {
+    let key = key.trim();
+    if let Some(keycode) = as_hid_keycode(key) {
+        let variant = format_ident!("{compact}");
+        return quote! {
+            ::rmk::keyboard_macros::MacroOperation::#variant(::rmk::types::keycode::HidKeyCode::#keycode).into_iter()
+        };
+    }
+    // No feature list means no `rmk` dependency to read — rmk's own test crate,
+    // where the scenario's `features` gate decides instead. Only reject when the
+    // manifest positively says `vial` is off.
+    if let Some(features) = get_rmk_features()
+        && !is_feature_enabled(&Some(features), "vial")
+    {
+        panic!(
+            "\n\u{274c} keyboard.toml: macro operation `{key}` is not a plain keycode, so it needs the extended encoding — enable rmk's `vial` feature or use a plain keycode"
+        );
+    }
+    let action = parse_action(key);
+    let variant = format_ident!("{extended}");
+    quote! { ::rmk::keyboard_macros::MacroOperation::#variant(#action).into_iter() }
+}
+
 fn expand_macros(macros: &Option<Macros>) -> proc_macro2::TokenStream {
     let default = quote! { ::core::default::Default::default() };
 
     match macros {
         Some(macros) => {
             let macros_def = macros.macros.iter().map(|m| {
+                if m.operations.is_empty() {
+                    // `[].into_iter().flatten().collect()` cannot infer the element type.
+                    return quote! { ::rmk::heapless::Vec::new() };
+                }
                 let operations = m.operations.iter().map(|op| match op {
-                    MacroOperation::Tap { keycode } => {
-                        let key = get_key_with_alias(keycode.trim().to_owned());
-                        quote! { ::rmk::keyboard_macros::MacroOperation::Tap(::rmk::types::keycode::KeyCode::#key).into_iter() }
-                    }
-                    MacroOperation::Down { keycode } => {
-                        let key = get_key_with_alias(keycode.trim().to_owned());
-                        quote! { ::rmk::keyboard_macros::MacroOperation::Press(::rmk::types::keycode::KeyCode::#key).into_iter() }
-                    }
-                    MacroOperation::Up { keycode } => {
-                        let key = get_key_with_alias(keycode.trim().to_owned());
-                        quote! { ::rmk::keyboard_macros::MacroOperation::Release(::rmk::types::keycode::KeyCode::#key).into_iter() }
-                    }
+                    MacroOperation::Tap { keycode } => expand_macro_key(keycode, "Tap", "TapAction"),
+                    MacroOperation::Down { keycode } => expand_macro_key(keycode, "Press", "PressAction"),
+                    MacroOperation::Up { keycode } => expand_macro_key(keycode, "Release", "ReleaseAction"),
                     MacroOperation::Delay { duration_ms } => {
-                        let millis = *duration_ms as u16;
+                        let millis = u16::try_from(*duration_ms).ok().filter(|ms| *ms <= 65024).unwrap_or_else(|| {
+                            panic!("\n\u{274c} keyboard.toml: macro delay {duration_ms}ms exceeds the 65024ms the Vial macro encoding can hold")
+                        });
                         quote! { ::rmk::keyboard_macros::MacroOperation::Delay(#millis).into_iter() }
                     }
                     MacroOperation::Text { text } => {
@@ -220,18 +298,18 @@ fn expand_morses(
             let morse_profile = expand_profile_name(profile_name, profiles);
             quote! { #morse_profile }
         } else {
-            quote! { rmk::types::action::MorseProfile::const_default() }
+            quote! { rmk::types::morse::MorseProfile::const_default() }
         };
 
         if let Some(morse_actions) = &morse.morse_actions {
             if morse.tap.is_some() || morse.hold.is_some() || morse.hold_after_tap.is_some() || morse.double_tap.is_some() || morse.tap_actions.is_some() || morse.hold_actions.is_some() {
-                panic!("\n❌ keyboard.toml: `morse_actions` cannot be used together with `tap_actions`, `hold_actions`, `tap`, `hold`, `hold_after_tap`, or `double_tap`. Please check the documentation: https://rmk.rs/docs/features/configuration/behavior.html#morse");
+                panic!("\n❌ keyboard.toml: `morse_actions` cannot be used together with `tap_actions`, `hold_actions`, `tap`, `hold`, `hold_after_tap`, or `double_tap`.");
             }
 
             let actions_def = expand_morse_actions(morse_actions, profiles);
 
             quote! {
-                ::rmk::morse::Morse {
+                ::rmk::types::morse::Morse {
                     profile: #profile,
                     #actions_def
                     ..Default::default()
@@ -241,7 +319,7 @@ fn expand_morses(
         } else if morse.tap_actions.is_some() || morse.hold_actions.is_some() {
             // Check first
             if morse.tap.is_some() || morse.hold.is_some() || morse.hold_after_tap.is_some() || morse.double_tap.is_some() {
-                panic!("\n❌ keyboard.toml: `tap_actions` and `hold_actions` cannot be used together with `tap`, `hold`, `hold_after_tap`, or `double_tap`. Please check the documentation: https://rmk.rs/docs/features/configuration/behavior.html#morse");
+                panic!("\n❌ keyboard.toml: `tap_actions` and `hold_actions` cannot be used together with `tap`, `hold`, `hold_after_tap`, or `double_tap`.");
             }
 
             let tap_actions_def = match &morse.tap_actions {
@@ -267,7 +345,7 @@ fn expand_morses(
             };
 
             quote! {
-                ::rmk::morse::Morse::new_with_actions(
+                ::rmk::types::morse::Morse::new_with_actions(
                     #tap_actions_def,
                     #hold_actions_def,
                     #profile,
@@ -280,7 +358,7 @@ fn expand_morses(
             let double_tap = parse_key(morse.double_tap.clone().unwrap_or_else(|| "No".to_string()), profiles);
 
             quote! {
-                ::rmk::morse::Morse::new_from_vial(
+                ::rmk::types::morse::Morse::new_from_vial(
                     #tap.to_action(),
                     #hold.to_action(),
                     #hold_after_tap.to_action(),
@@ -374,7 +452,7 @@ impl quote::ToTokens for StateBitsMacro {
         let button8 = self.mouse_button8;
 
         tokens.extend(quote! {
-            ::rmk::fork::StateBits::new_from(
+            ::rmk::types::fork::StateBits::new_from(
                 ::rmk::types::modifier::ModifierCombination::new_from_vals(#left_ctrl, #left_shift, #left_alt, #left_gui, #right_ctrl, #right_shift, #right_alt, #right_gui),
                 ::rmk::types::led_indicator::LedIndicator::new_from(#num_lock, #caps_lock, #scroll_lock, #compose, #kana),
                 ::rmk::types::mouse_button::MouseButtons::new_from(#button1, #button2, #button3, #button4, #button5, #button6, #button7, #button8))
@@ -384,39 +462,31 @@ impl quote::ToTokens for StateBitsMacro {
 
 /// Get modifier combination, in types of mod1 | mod2 | ...
 fn parse_state_combination(states_str: &str) -> StateBitsMacro {
-    let mut combination = StateBitsMacro::default();
-    let tokens = states_str.split_terminator("|");
-    tokens.for_each(|w| {
-        let w = w.trim();
-        match w {
-            "LCtrl" => combination.modifiers_left_ctrl = true,
-            "LShift" => combination.modifiers_left_shift = true,
-            "LAlt" => combination.modifiers_left_alt = true,
-            "LGui" => combination.modifiers_left_gui = true,
-            "RCtrl" => combination.modifiers_right_ctrl = true,
-            "RShift" => combination.modifiers_right_shift = true,
-            "RAlt" => combination.modifiers_right_alt = true,
-            "RGui" => combination.modifiers_right_gui = true,
+    const STATES: &SetterTable<StateBitsMacro> = &[
+        ("LCtrl", |c| c.modifiers_left_ctrl = true),
+        ("LShift", |c| c.modifiers_left_shift = true),
+        ("LAlt", |c| c.modifiers_left_alt = true),
+        ("LGui", |c| c.modifiers_left_gui = true),
+        ("RCtrl", |c| c.modifiers_right_ctrl = true),
+        ("RShift", |c| c.modifiers_right_shift = true),
+        ("RAlt", |c| c.modifiers_right_alt = true),
+        ("RGui", |c| c.modifiers_right_gui = true),
+        ("NumLock", |c| c.leds_num_lock = true),
+        ("CapsLock", |c| c.leds_caps_lock = true),
+        ("ScrollLock", |c| c.leds_scroll_lock = true),
+        ("Compose", |c| c.leds_compose = true),
+        ("Kana", |c| c.leds_kana = true),
+        ("MouseBtn1", |c| c.mouse_button1 = true),
+        ("MouseBtn2", |c| c.mouse_button2 = true),
+        ("MouseBtn3", |c| c.mouse_button3 = true),
+        ("MouseBtn4", |c| c.mouse_button4 = true),
+        ("MouseBtn5", |c| c.mouse_button5 = true),
+        ("MouseBtn6", |c| c.mouse_button6 = true),
+        ("MouseBtn7", |c| c.mouse_button7 = true),
+        ("MouseBtn8", |c| c.mouse_button8 = true),
+    ];
 
-            "NumLock" => combination.leds_num_lock = true,
-            "CapsLock" => combination.leds_caps_lock = true,
-            "ScrollLock" => combination.leds_scroll_lock = true,
-            "Compose" => combination.leds_compose = true,
-            "Kana" => combination.leds_kana = true,
-
-            "MouseBtn1" => combination.mouse_button1 = true,
-            "MouseBtn2" => combination.mouse_button2 = true,
-            "MouseBtn3" => combination.mouse_button3 = true,
-            "MouseBtn4" => combination.mouse_button4 = true,
-            "MouseBtn5" => combination.mouse_button5 = true,
-            "MouseBtn6" => combination.mouse_button6 = true,
-            "MouseBtn7" => combination.mouse_button7 = true,
-            "MouseBtn8" => combination.mouse_button8 = true,
-            _ => (),
-        }
-    });
-
-    combination
+    parse_name_list(states_str, "state", "fork state", STATES, |w| w)
 }
 
 fn expand_forks(
@@ -436,10 +506,10 @@ fn expand_forks(
                 let bindable = fork.bindable;
 
                 if match_any.is_empty() && match_none.is_empty() {
-                    panic!("\n❌ keyboard.toml: fork configuration missing match conditions! Please check the documentation: https://rmk.rs/docs/features/configuration/behavior.html#fork");
+                    panic!("\n❌ keyboard.toml: fork configuration missing match conditions!");
                 }
 
-                quote! { ::rmk::fork::Fork::new_ex(#trigger, #negative_output, #positive_output, #match_any, #match_none, #kept, #bindable) }
+                quote! { ::rmk::types::fork::Fork::new(#trigger, #negative_output, #positive_output, #match_any, #match_none, #kept.modifiers, #bindable) }
             });
 
             quote! {
@@ -450,6 +520,47 @@ fn expand_forks(
             }
         }
         None => default,
+    }
+}
+
+fn expand_auto_mouse_layer(auto_mouse_layer: &[AutoMouseLayer]) -> proc_macro2::TokenStream {
+    if auto_mouse_layer.is_empty() {
+        return quote! { ::core::default::Default::default() };
+    }
+    let entries = auto_mouse_layer.iter().map(|cfg| {
+        let target_layer = cfg.target_layer;
+        let timeout_ms = cfg.timeout_ms;
+        let threshold = cfg.threshold;
+        let device_id = match cfg.device_id {
+            Some(id) => quote! { ::core::option::Option::Some(#id) },
+            None => quote! { ::core::option::Option::None },
+        };
+        let deactivate_on_key = cfg.deactivate_on_key;
+        let reset_timeout_on_key = cfg.reset_timeout_on_key;
+        let exception_idents: Vec<_> = cfg
+            .extra_mouse_keys
+            .iter()
+            .map(|k| get_key_with_alias(k.clone()))
+            .collect();
+        let exception_tokens = exception_idents.iter().map(|ident| {
+            quote! {
+                ::rmk::types::keycode::KeyCode::Hid(::rmk::types::keycode::HidKeyCode::#ident)
+            }
+        });
+        quote! {
+            ::rmk::config::AutoMouseLayerConfig {
+                device_id: #device_id,
+                target_layer: #target_layer,
+                timeout: ::embassy_time::Duration::from_millis(#timeout_ms),
+                threshold: #threshold,
+                deactivate_on_key: #deactivate_on_key,
+                extra_mouse_keys: &[#(#exception_tokens),*],
+                reset_timeout_on_key: #reset_timeout_on_key,
+            }
+        }
+    });
+    quote! {
+        ::rmk::heapless::Vec::from_iter([#(#entries),*])
     }
 }
 
@@ -467,6 +578,7 @@ pub(crate) fn expand_behavior_config(behavior: &Behavior) -> proc_macro2::TokenS
     let macros = expand_macros(&behavior.macros);
     let forks = expand_forks(&behavior.forks, &profiles);
     let morse = expand_morse(&behavior.morse);
+    let auto_mouse_layer = expand_auto_mouse_layer(&behavior.auto_mouse_layer);
 
     quote! {
         #[allow(clippy::needless_update)]
@@ -480,6 +592,46 @@ pub(crate) fn expand_behavior_config(behavior: &Behavior) -> proc_macro2::TokenS
             keyboard_macros: #macros,
             mouse_key: ::rmk::config::MouseKeyConfig::default(),
             tap: ::rmk::config::TapConfig::default(),
+            auto_mouse_layer: #auto_mouse_layer,
+            ..Default::default()
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_state_combination_sets_bits_for_valid_states() {
+        let s = parse_state_combination("LShift|MouseBtn1 |CapsLock");
+        assert!(s.modifiers_left_shift);
+        assert!(s.mouse_button1);
+        assert!(s.leds_caps_lock);
+        assert!(!s.modifiers_right_ctrl);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown state(s) [NumLok (did you mean NumLock?)]")]
+    fn parse_state_combination_rejects_unknown_state() {
+        let _ = parse_state_combination("NumLok | LShift");
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown state(s) [capslock (did you mean CapsLock?)]")]
+    fn parse_state_combination_suggests_canonical_casing() {
+        let _ = parse_state_combination("capslock | LShift");
+    }
+
+    #[test]
+    #[should_panic(expected = "empty segment")]
+    fn parse_state_combination_rejects_trailing_separator() {
+        let _ = parse_state_combination("LShift|");
+    }
+
+    #[test]
+    #[should_panic(expected = "empty segment")]
+    fn parse_state_combination_rejects_doubled_separator() {
+        let _ = parse_state_combination("CapsLock || MouseBtn1");
     }
 }

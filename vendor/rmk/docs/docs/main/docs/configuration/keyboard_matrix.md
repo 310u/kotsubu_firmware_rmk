@@ -1,6 +1,6 @@
 # Keyboard Matrix
 
-This section covers the basic keyboard identification and physical matrix configuration in your `keyboard.toml` file.
+This section covers the physical matrix configuration in your `keyboard.toml` file.
 
 ## Matrix Configuration
 
@@ -21,7 +21,6 @@ Output Pin (Column) → |>| → Input Pin (Row)
 ```
 
 By default, RMK assumes that your pins are **col2row**, meaning that the output pins (anodes) represent the columns and the input pins (cathodes) represent the rows. If your schematic shows the opposite, you need to [change the configuration to **row2col**](../getting_started/faq#my-matrix-is-row2col-the-matrix-doesnt-work)
-
 
 ### Standard Matrix Configuration
 
@@ -95,17 +94,60 @@ direct_pin_low_active = true
 - `false`: The pin is pulled low by default, pressing a key pulls it to high
 - Use `"_"` or `"trns"` for unused positions in the matrix
 
+### Bootmagic - Bootloader Recovery via a Held Key
+
+Bootmagic lets you drop into the chip's USB bootloader (e.g. BOOTSEL mode on RP2040) by holding a designated key while the firmware boots. This is useful if the physical BOOTSEL/RESET button can't be reached without disassembling the keyboard. For a unibody keyboard:
+
+```toml
+[matrix]
+bootmagic = [0, 0] # (row=0, col=0), typically the ESC key
+```
+
+For direct-pin matrices, the same syntax works; the configured cell must point to a real pin (not `"_"`/`"trns"`). RMK will refuse to compile if you reference a placeholder cell.
+
+For a split keyboard, configure each half independently:
+
+```toml
+[split.central.matrix]
+bootmagic = [0, 0]
+
+[split.peripheral.matrix]
+bootmagic = [0, 0]
+```
+
+Note the sides are commonly mirrored, so this configuration might refer to the outermost column for each side.
+
+::: warning
+**Do not unplug or reseat a TRRS connector joining halves of a split keyboard.** This is tempting when flashing the peripheral side, but TRRS connectors short adjacent ring contacts as the plug slides in or out, which on a split keyboard typically means momentarily shorting `VCC` to `GND` (or to a data line) across the connector. That can permanently damage the MCU on either half.
+
+A safe procedure to flash the peripheral side:
+
+1. Remove USB connector between central side and host.
+2. Attach USB connector between peripheral side and host, while holding the peripheral side's bootmagic key.
+3. Flash.
+4. Remove USB connector between peripheral side and host.
+5. Restore USB connector between central side and host.
+   :::
+
+**Bootmagic Behavior:**
+
+- The scan runs once at boot, before the keyboard task or USB enumeration, and adds ~50µs to boot time when configured
+- Jumping to the bootloader needs the matching `rmk` Cargo feature: `rp2040` for the RP2040 BOOTSEL bootloader, `adafruit_bl` for the Adafruit nRF52 bootloader, or `zsa_voyager_bl` for the ZSA Voyager bootloader. Without one of them, the held key only reboots the keyboard
+
+If `bootmagic` is omitted, no scan is performed and there is zero runtime overhead.
+
 ### Debouncer
 
 RMK has two debouncer modes, "default" and "fast":
+
 - The default mode uses a counter-based algorithm that registers a key only after its counter exceeds a certain threshold.
 - The fast mode, on the other hand, reacts instantly to a key press and then waits briefly before accepting the next input.
 
 If no `debouncer` is set, the matrix will default to `default` mode.
 
-## Vial Unlock Keys - `[host]` Section
+## Host Unlock Keys - `[host]` Section
 
-For enhanced security, Vial locks certain functions (like matrix testing) by default. You can set a key combination to unlock it. This configuration is part of the `[host]` section which controls host-side tools and features.
+`unlock_keys` sets the physical key combination used to unlock protected host operations. When the `host_lock` Cargo feature is enabled alongside Vial, Vial uses it for secured configurator features such as matrix testing. [Rynk](../features/rynk) uses it as a physical-presence challenge for locked operations such as bootloader entry, storage reset, matrix-state reads, and optional configuration writes. For Rynk, leave it unset only if those locked operations should stay inaccessible or you intentionally enable `insecure = true` during development.
 
 ```toml
 [host]
@@ -115,10 +157,11 @@ unlock_keys = [[0, 0], [0, 1]]  # Keys at (row=0,col=0) and (row=0,col=1)
 ```
 
 ::: tip
+
 - The unlock keys use the physical matrix position (row, column), not the keycode
 - Choose keys that are easy to press simultaneously but not commonly pressed together accidentally
-- See the [Vial Support](../features/vial_support.mdx) page for more details on Vial configuration
-:::
+- See [Vial Support](../features/vial_support) for Vial setup and [Host Configuration](./host_config) for the full `[host]` options
+  :::
 
 ## Troubleshooting
 

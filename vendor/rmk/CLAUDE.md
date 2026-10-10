@@ -20,15 +20,27 @@ The `scripts` directory contains useful scripts for checking/formatting code
 ## Commands
 
 ### Testing
-Run from the `rmk/` directory:
 
+Keyboard behavior is tested by the TOML scenarios in `rmk/tests/scenarios/`, which
+`run_tests!` expands into ordinary tests. Read `rmk/tests/scenarios/README.md`
+before adding a test: it documents the step and assertion vocabulary, and how to
+write a case that fails for the right reason.
+
+Dev loop — one feature set, from `rmk/` (requires `cargo nextest`):
 ```bash
-cargo test --no-default-features --features=split,vial,storage,async_matrix,_ble
+cargo nextest run --no-default-features --features=split,vial,storage,async_matrix,_ble
 ```
 
-Run macro tests from `rmk-macro/` (requires `cargo-expand`):
+Run macro tests from `rmk-macro/` (requires `cargo expand`).
+
+Run format test from root:
 ```bash
-cargo test
+bash scripts/format_all.sh
+```
+
+Behavioral test suite (the three RMK feature rows CI runs):
+```bash
+bash scripts/test_all.sh
 ```
 
 ### Building examples
@@ -36,16 +48,6 @@ Examples target specific MCUs; build from an example directory, e.g.:
 ```bash
 cd examples/use_config/nrf52840_ble
 cargo build --release
-```
-
-### Checks
-```bash
-# Format all Rust files
-sh scripts/format_all.sh
-# Run clippy for all examples and crates
-sh scripts/clippy_all.sh
-# Build all examples to check
-sh scripts/check_all.sh
 ```
 
 ## Architecture
@@ -57,14 +59,18 @@ Matrix / InputDevices → Events (pub/sub channels) -> InputProcessors/Keyboard(
 
 ### `keyboard.toml` and compile-time constants
 
-`keyboard.toml` is parsed by `rmk-config` (`KeyboardTomlConfig`) at two points: by `rmk/build.rs` at build time, and by `rmk-macro` at macro-expansion time. The path defaults to `keyboard.toml` next to `Cargo.toml` and can be overridden with `KEYBOARD_TOML_PATH` in user space's `.cargo/config.toml`.
+`keyboard.toml` is parsed by `rmk-config` (`KeyboardTomlConfig`) at two points: by `rmk-types/build.rs` at build time, and by `rmk-macro` at macro-expansion time. The path defaults to `keyboard.toml` next to `Cargo.toml` and can be overridden with `KEYBOARD_TOML_PATH` in user space's `.cargo/config.toml`.
 
 Config is loaded in three layers (later overrides earlier): `event_default.toml` → chip-specific default (from `rmk-config/src/default_config/<chip>.toml`, selected via `[keyboard].chip`) → user `keyboard.toml`.
 
-`build.rs` reads only the `[rmk]` and `[event]` sections, then emits `constants.rs` as Rust `const` items. The full `KeyboardTomlConfig` struct in `rmk-config/src/lib.rs` is the authoritative reference for all available fields and their defaults.
+`rmk-types/build.rs` reads only the `[rmk]` and `[event]` sections, then emits `constants.rs` as Rust `const` items. The full `KeyboardTomlConfig` struct in `rmk-config/src/lib.rs` is the authoritative reference for all available fields and their defaults.
 
 `[event]` tunes per-event pub/sub channel sizes (`channel_size`, `pubs`, `subs`). All event names and their defaults live in `rmk-config/src/default_config/event_default.toml`.
 
 ## Rules
 
 - Don't use `pub use` for convenient usage **within** the crate
+- Don't add a small helper function (≤ 10 lines) that has only one call site — inline it at the call site
+- When writing code comments, follow the principles in [Best practices for writing code comments](https://stackoverflow.blog/2021/12/23/best-practices-for-writing-code-comments/)
+- When writing documentation and READMEs, follow the principles in [Best practices for GitHub Docs](https://docs.github.com/en/contributing/writing-for-github-docs/best-practices-for-github-docs)
+- If you need a paragraph-long comment to justify why the workaround is OK, the code is wrong — fix the code.

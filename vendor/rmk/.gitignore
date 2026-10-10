@@ -1,6 +1,9 @@
 target
 node_modules
 
+# wasm-pack output
+pkg
+
 .DS_Store
 
 *.bin
@@ -9,12 +12,14 @@ node_modules
 *.uf2
 
 .idea
+.direnv/
 
 # ignore Cargo.lock of library, but keep it for binaries
 rmk/Cargo.lock
 rmk-macro/Cargo.lock
 rmk-config/Cargo.lock
 rmk-types/Cargo.lock
+rynk/Cargo.lock
 
 # esp idf build files
 .embuild

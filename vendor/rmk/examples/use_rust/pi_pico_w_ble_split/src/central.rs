@@ -13,37 +13,38 @@ use cyw43_pio::PioSpi;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
-use embassy_rp::clocks::RoscRng;
 use embassy_rp::flash::{Async, Flash};
 use embassy_rp::gpio::{Input, Level, Output};
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0, USB};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, PIO0, USB};
 use embassy_rp::pio::{self, Pio};
 use embassy_rp::usb::{self, Driver};
 use embassy_time as _;
 use keymap::{COL, ROW};
 use panic_probe as _;
-use rand::SeedableRng;
-use rmk::ble::build_ble_stack;
+use rmk::ble::BleTransport;
 use rmk::config::{BehaviorConfig, DeviceConfig, PositionalConfig, RmkConfig, StorageConfig, VialConfig};
 use rmk::debounce::default_debouncer::DefaultDebouncer;
-use rmk::futures::future::join3;
-use rmk::input_device::Runnable;
+use rmk::host::HostService;
 use rmk::keyboard::Keyboard;
 use rmk::matrix::Matrix;
-use rmk::split::ble::central::{read_peripheral_addresses, scan_peripherals};
-use rmk::split::central::run_peripheral_manager;
-use rmk::{HostResources, KeymapData, initialize_keymap_and_storage, run_all, run_rmk};
+use rmk::processor::builtin::wpm::WpmProcessor;
+use rmk::split::PeripheralMatrixConfig;
+use rmk::usb::UsbTransport;
+use rmk::watchdog::Rp2040Watchdog;
+use rmk::{KeymapData, initialize_keymap_and_storage, run_all};
 use static_cell::StaticCell;
 use vial::{VIAL_KEYBOARD_DEF, VIAL_KEYBOARD_ID};
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
     PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
-    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>, embassy_rp::dma::InterruptHandler<DMA_CH1>;
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>, embassy_rp::dma::InterruptHandler<DMA_CH1>, embassy_rp::dma::InterruptHandler<DMA_CH2>;
 });
 
 #[embassy_executor::task]
-async fn cyw43_task(runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>>) -> ! {
+async fn cyw43_task(
+    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>, cyw43::Cyw43439>,
+) -> ! {
     runner.run().await
 }
 
@@ -86,6 +87,7 @@ async fn main(spawner: Spawner) {
         p.PIN_24,
         p.PIN_29,
         embassy_rp::dma::Channel::new(p.DMA_CH0, Irqs),
+        embassy_rp::dma::Channel::new(p.DMA_CH2, Irqs),
     );
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
@@ -114,7 +116,7 @@ async fn main(spawner: Spawner) {
         pid: 0x464c,
         manufacturer: "Haobo",
         product_name: "RMK PicoW Split",
-        serial_number: "vial:f64c2b3c:000001",
+        ..DeviceConfig::default()
     };
 
     let vial_config = VialConfig::new(VIAL_KEYBOARD_ID, VIAL_KEYBOARD_DEF, &[(0, 0), (1, 1)]);
@@ -149,27 +151,36 @@ async fn main(spawner: Spawner) {
     let debouncer = DefaultDebouncer::new();
     let mut matrix = Matrix::<_, _, _, ROW, COL, true>::new(row_pins, col_pins, debouncer);
     let mut keyboard = Keyboard::new(&keymap);
-
-    // Read peripheral address from storage
-    let peripheral_addrs = read_peripheral_addresses::<1, _, 4, 3, 2, 0>(&mut storage).await;
+    let host_service = HostService::new(&keymap, &rmk_config);
 
     let ble_addr = [0x18, 0xe2, 0x21, 0x88, 0xc0, 0xc7];
 
-    let mut host_resources = HostResources::new();
-    let mut rosc_rng = RoscRng {};
-    let mut rng = rand_chacha::ChaCha12Rng::from_rng(&mut rosc_rng).unwrap();
-
-    let stack = build_ble_stack(controller, ble_addr, &mut rng, &mut host_resources).await;
+    let mut usb_transport = UsbTransport::new(driver, rmk_config.device_config).with_host_service(&host_service);
+    // The other half: 4x7 at row offset 4 (keymap rows 4..8).
+    let mut ble_transport = BleTransport::new(
+        controller,
+        ble_addr,
+        rmk_config,
+        [PeripheralMatrixConfig {
+            rows: 4,
+            cols: 7,
+            row_offset: 4,
+            col_offset: 0,
+        }],
+    )
+    .with_host_service(&host_service);
+    let mut wpm_processor = WpmProcessor::new();
+    let mut watchdog_runner = Rp2040Watchdog::default_runner(embassy_rp::watchdog::Watchdog::new(p.WATCHDOG));
 
     // Start
-    join3(
-        run_all!(matrix),
-        keyboard.run(),
-        join3(
-            run_peripheral_manager::<4, 7, 4, 0, _>(0, &peripheral_addrs, &stack),
-            run_rmk(&keymap, driver, &stack, &mut storage, rmk_config),
-            scan_peripherals(&stack, &peripheral_addrs),
-        ),
+    run_all!(
+        matrix,
+        storage,
+        usb_transport,
+        ble_transport,
+        wpm_processor,
+        keyboard,
+        watchdog_runner
     )
     .await;
 }

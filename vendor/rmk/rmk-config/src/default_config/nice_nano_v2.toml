@@ -5,6 +5,8 @@ usb_enable = true
 enabled = true
 battery_adc_pin = "vddh"
 
+[dfu]
+
 [storage]
 enabled = true
 # Storage starts from 640K

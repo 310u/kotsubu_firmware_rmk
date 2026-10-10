@@ -52,21 +52,21 @@ cargo +nightly size --release
 
 RMK provides several options that you can use to reduce the binary size:
 
-1. If you don't need storage, you can disable the `storage` feature to save some flash. To disable `storage` feature you need to disable default features of `rmk` crate, and then enable other features you need.
+1. If you don't need storage, you can disable the `storage` feature to save some flash. To disable `storage` feature you need to disable default features of `rmk` crate, and then enable other features you need. This only works for USB-only builds: every BLE chip feature and the `dongle` feature enable `storage` themselves.
 
-2. You can also fully remove `defmt` by removing `defmt` feature from `rmk` crate and similar feature gates from all other dependencies.
+2. You can also fully remove `defmt` by removing `defmt` feature from `rmk` crate and similar feature gates from all other dependencies. Setting `defmt_log = false` in `keyboard.toml` (see below) only replaces `defmt-rtt` with a logger that discards everything; `defmt` and `panic-probe` stay in your `Cargo.toml`.
 
-3. If you don't need vial support, you can also disable the `vial` feature by disabling default features of `rmk` crate.
+3. If you don't need on-the-fly configuration, you can disable the host configurator feature by disabling default features of the `rmk` crate.
 
 ```toml
-# Default features `defmt`, `vial`, and `storage` are disabled
-rmk = { version = "...", default-features = false }
+# The default features `defmt`, `storage`, `vial`, `host_lock`, and `watchdog` are all disabled
+rmk = { version = "0.9", default-features = false }
 ```
 
-If you're using `keyboard.toml`, you'll also need to disable storage, defmt, and vial in the toml config:
+If you're using `keyboard.toml`, you'll also need to disable storage, defmt logging, and the host protocol in the toml config:
 
 ```toml
-# Disable storage, defmt and vial in keyboard.toml
+# Disable storage, defmt logging and the host protocol in keyboard.toml
 [storage]
 enabled = false
 
@@ -74,7 +74,9 @@ enabled = false
 defmt_log = false
 
 [host]
+# With no host feature enabled, both must be false (they must match the Cargo features)
 vial_enabled = false
+rynk_enabled = false
 ```
 
 ## For Rust code users
@@ -86,7 +88,7 @@ By default, RMK uses `panic-probe` to print error messages if panic occurs. But 
 ```diff
 # In your binary's Cargo.toml
 
-- panic-probe = { version = "1.0", features = ["print-defmt"] }
+- panic-probe = { version = "1", features = ["print-defmt"] }
 + panic-halt = "1.0"
 ```
 
@@ -106,7 +108,7 @@ You can also remove the entire defmt-rtt logger to save flash.
 
 ```diff
 # In your binary's Cargo.toml
-- defmt-rtt = "1.0"
+- defmt-rtt = "1"
 ```
 
 In this case, you have to implement an empty defmt logger.
@@ -127,13 +129,13 @@ In this case, you have to implement an empty defmt logger.
 
 ```
 
-### Totally remove storage and vial support
+### Totally remove storage and host configurator support
 
-You can disable `storage` and `vial` feature in `Cargo.toml`:
+You can disable the `storage` and host protocol (`vial`, or `rynk` if you enabled it) features in `Cargo.toml`:
 
 ```toml
-# Default features `defmt`, `vial`, and `storage` are disabled
-rmk = { version = "...", default-features = false }
+# The default features `defmt`, `storage`, `vial`, `host_lock`, and `watchdog` are all disabled
+rmk = { version = "0.9", default-features = false }
 ```
 
 And then remove anything no longer needed in `main.rs`.

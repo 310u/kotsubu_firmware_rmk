@@ -1,42 +1,53 @@
 use std::path::Path;
 use std::{env, fs};
 
-use rmk_config::KeyboardTomlConfig;
 use rmk_config::resolved::BuildConstants;
+use rmk_config::{KeyboardTomlConfig, protocol_limits};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=KEYBOARD_TOML_PATH");
     println!("cargo:rerun-if-env-changed=VIAL_JSON_PATH");
 
-    // Load keyboard.toml if it's present.
-    //
-    // Build-time constants only need [rmk] + [event]. Keep event defaults support
-    // without requiring [keyboard.board]/[keyboard.chip].
-    let config: KeyboardTomlConfig = if let Ok(toml_path) = std::env::var("KEYBOARD_TOML_PATH") {
+    // Load compile-time constants with event defaults, without requiring
+    // chip-specific defaults from [keyboard.board]/[keyboard.chip].
+    let toml_path = std::env::var("KEYBOARD_TOML_PATH").ok();
+    let config: KeyboardTomlConfig = if let Some(toml_path) = &toml_path {
         println!("cargo:rerun-if-changed={toml_path}");
-        KeyboardTomlConfig::new_from_toml_path_with_event_defaults(&toml_path)
+        KeyboardTomlConfig::new_from_toml_path_with_event_defaults(toml_path)
     } else {
         toml::from_str("").expect("Failed to parse empty keyboard config\n")
     };
 
-    // Collect active feature flags.
-    // The number of event subscribers bumps according to the enabled feature.
+    // Enabled features drive constant resolution (notably event subscriber counts).
     let active_features = collect_active_features();
     let feature_refs: Vec<&str> = active_features.iter().map(|s| s.as_str()).collect();
+
+    if let Some(conflict) = config.dfu_storage_conflict()
+        && active_features.iter().any(|f| f == "dfu")
+    {
+        let keys = match (conflict.start_addr_set, conflict.num_sectors_set) {
+            (true, true) => "[storage] start_addr and num_sectors",
+            (true, false) => "[storage] start_addr",
+            (false, true) => "[storage] num_sectors",
+            (false, false) => unreachable!(),
+        };
+        println!(
+            "cargo:warning={keys} have no effect while [dfu] is enabled: the storage partition size and position are fixed by the bootloader linker script (rmk-boot build.rs STORAGE_SIZE -> rmk-memory.x, default 8 x 4K = 32K). Change it there and re-flash the bootloader"
+        );
+    }
 
     let bc = config
         .build_constants(&feature_refs)
         .unwrap_or_else(|err| panic!("Failed to resolve build constants: {err}"));
-    let output = generate_constants(&bc);
+    let output = generate_constants(&bc, &config);
 
-    // Write to constants.rs file
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("constants.rs");
     fs::write(&dest_path, output).expect("Failed to write constants.rs file");
 }
 
-fn generate_constants(bc: &BuildConstants) -> String {
+fn generate_constants(bc: &BuildConstants, config: &KeyboardTomlConfig) -> String {
     let mut lines = Vec::new();
 
     // Direct constants
@@ -69,6 +80,22 @@ fn generate_constants(bc: &BuildConstants) -> String {
         "pub const SPLIT_PERIPHERALS_NUM: usize = {};",
         bc.split_peripherals_num
     ));
+    lines.push(format!(
+        "pub const CENTRAL_BATTERY_USER_DESCRIPTION: &str = {:?};",
+        bc.central_battery_user_description
+    ));
+    lines.push(format!(
+        "pub const SPLIT_BATTERY_PERIPHERALS_NUM: usize = {};",
+        bc.split_battery_peripheral_ids.len()
+    ));
+    lines.push(format!(
+        "pub const SPLIT_BATTERY_PERIPHERAL_IDS: [usize; SPLIT_BATTERY_PERIPHERALS_NUM] = {:?};",
+        bc.split_battery_peripheral_ids
+    ));
+    lines.push(format!(
+        "pub const SPLIT_BATTERY_PERIPHERAL_USER_DESCRIPTIONS: [&str; SPLIT_BATTERY_PERIPHERALS_NUM] = {:?};",
+        bc.split_battery_peripheral_user_descriptions
+    ));
     lines.push(format!("pub const NUM_BLE_PROFILE: usize = {};", bc.ble_profiles_num));
     lines.push(format!(
         "pub const SPLIT_CENTRAL_SLEEP_TIMEOUT_SECONDS: u32 = {};",
@@ -76,9 +103,87 @@ fn generate_constants(bc: &BuildConstants) -> String {
     ));
     lines.push(format!("pub const MORSE_MAX_NUM: usize = {};", bc.morse_max_num));
     lines.push(format!(
+        "pub const MORSE_PROFILE_MAX_NUM: usize = {};",
+        bc.morse_profile_max_num
+    ));
+    lines.push(format!(
+        "pub const AUTO_MOUSE_LAYER_MAX_NUM: usize = {};",
+        bc.auto_mouse_layer_max_num
+    ));
+    lines.push(format!(
         "pub const MAX_PATTERNS_PER_KEY: usize = {};",
         bc.max_patterns_per_key
     ));
+
+    // Host uses protocol ceilings; firmware uses keyboard.toml/default capacities.
+    let is_host = env::var("CARGO_FEATURE_HOST").is_ok();
+
+    // Protocol ceilings — always emitted so rmk-types source code can reference them.
+    lines.push(format!(
+        "pub const MAX_COMBO_SIZE: usize = {};",
+        protocol_limits::MAX_COMBO_SIZE
+    ));
+    lines.push(format!(
+        "pub const MAX_MORSE_SIZE: usize = {};",
+        protocol_limits::MAX_MORSE_SIZE
+    ));
+    lines.push(format!(
+        "pub const MAX_MACRO_DATA_SIZE: usize = {};",
+        protocol_limits::MAX_MACRO_DATA_SIZE
+    ));
+
+    if is_host {
+        // Host: Vec capacities equal protocol ceilings for wire compatibility with any firmware.
+        lines.push(format!(
+            "pub const COMBO_SIZE: usize = {};",
+            protocol_limits::MAX_COMBO_SIZE
+        ));
+        lines.push(format!(
+            "pub const MORSE_SIZE: usize = {};",
+            protocol_limits::MAX_MORSE_SIZE
+        ));
+        lines.push(format!(
+            "pub const MACRO_DATA_SIZE: usize = {};",
+            protocol_limits::MAX_MACRO_DATA_SIZE
+        ));
+    } else {
+        // Firmware: per-item constants from keyboard.toml / defaults.
+        lines.push(format!("pub const COMBO_SIZE: usize = {};", bc.combo_max_length));
+        lines.push(format!("pub const MORSE_SIZE: usize = {};", bc.max_patterns_per_key));
+        lines.push(format!(
+            "pub const MACRO_DATA_SIZE: usize = {};",
+            bc.protocol_macro_chunk_size
+        ));
+        // Firmware Vec sizes must not exceed protocol ceilings (rynk builds only).
+        if env::var("CARGO_FEATURE_RYNK").is_ok() {
+            lines.push("const _: () = assert!(COMBO_SIZE <= MAX_COMBO_SIZE, \"firmware COMBO_SIZE exceeds protocol ceiling MAX_COMBO_SIZE\");".to_string());
+            lines.push("const _: () = assert!(MORSE_SIZE <= MAX_MORSE_SIZE, \"firmware MORSE_SIZE exceeds protocol ceiling MAX_MORSE_SIZE\");".to_string());
+            lines.push("const _: () = assert!(MACRO_DATA_SIZE <= MAX_MACRO_DATA_SIZE, \"firmware MACRO_DATA_SIZE exceeds protocol ceiling MAX_MACRO_DATA_SIZE\");".to_string());
+        }
+    }
+
+    // The exact RAM of each rynk frame buffer; the payload budget and bulk
+    // capacities derive from it in `protocol::rynk`.
+    if env::var("CARGO_FEATURE_RYNK").is_ok() {
+        lines.push(format!("pub const RYNK_BUFFER_SIZE: usize = {};", bc.rynk_buffer_size));
+
+        // The physical layout served over `GetLayout`, baked here so that firmware
+        // reads it from `RmkConfig::default()`. Empty without a `[layout]` section.
+        let blob = config
+            .layout()
+            .unwrap_or_else(|err| panic!("Failed to resolve the layout blob: {err}"))
+            .blob;
+        lines.push(format!("pub const LAYOUT_BLOB: &[u8] = b\"{}\";", blob.escape_ascii()));
+    }
+
+    // How long one dongle pairing window lasts. It bonds exactly one keyboard,
+    // so there is nothing else about the relay to size.
+    if env::var("CARGO_FEATURE_DONGLE").is_ok() {
+        lines.push(format!(
+            "pub const DONGLE_PAIRING_WINDOW_SECS: u32 = {};",
+            bc.dongle_pairing_window_secs
+        ));
+    }
 
     // Event channels
     for ev in &bc.events {
@@ -109,18 +214,13 @@ fn generate_constants(bc: &BuildConstants) -> String {
         }
     }
 
-    lines
-        .into_iter()
-        .map(|s| "#[allow(clippy::redundant_static_lifetimes)]\n".to_owned() + s.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
+    lines.join("\n")
 }
 
-/// Collect active Cargo feature flags from environment variables.
+/// Active Cargo feature flags, lowercased to match `subscriber_default.toml`.
 ///
-/// Cargo sets `CARGO_FEATURE_<NAME>` for each enabled feature (with the name
-/// uppercased and `-` replaced by `_`). We reverse that to get lowercase names
-/// matching the convention used in `subscriber_default.toml`.
+/// Cargo exposes each enabled feature as `CARGO_FEATURE_<NAME>` (uppercased,
+/// `-` → `_`); we reverse that.
 fn collect_active_features() -> Vec<String> {
     env::vars()
         .filter_map(|(key, _)| key.strip_prefix("CARGO_FEATURE_").map(|f| f.to_lowercase()))

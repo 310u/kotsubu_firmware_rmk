@@ -789,20 +789,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use embassy_futures::block_on;
     use embedded_hal_mock::eh1::digital::{Mock as PinMock, State as PinState, Transaction as PinTrans};
     use embedded_hal_mock::eh1::spi::{Mock as SpiMock, Transaction as SpiTrans};
 
     use super::*;
-
-    // Init logger for tests
-    #[ctor::ctor]
-    fn init_log() {
-        let _ = env_logger::builder()
-            .filter_level(log::LevelFilter::Debug)
-            .is_test(true)
-            .try_init();
-    }
+    use crate::test_support::test_block_on as block_on;
 
     #[test]
     fn test_device_creation() {

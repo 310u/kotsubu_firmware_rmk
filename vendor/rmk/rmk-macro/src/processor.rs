@@ -21,9 +21,11 @@ pub fn parse_processor_config(
 ) -> Result<ProcessorConfig, TokenStream> {
     let parser = AttributeParser::new_validated(tokens, &["subscribe", "poll_interval"])?;
 
+    let poll_interval_ms = parser.get_int("poll_interval")?;
+
     Ok(ProcessorConfig {
         event_types: parser.get_path_array("subscribe")?,
-        poll_interval_ms: parser.get_int("poll_interval")?,
+        poll_interval_ms,
     })
 }
 
@@ -40,28 +42,34 @@ pub fn processor_impl(
 
     // Merge sibling #[processor] attributes (e.g. from cfg_attr expansion)
     for attr in &input.attrs {
-        if attr.path().is_ident("processor") {
-            if let Meta::List(meta_list) = &attr.meta {
-                match parse_processor_config(meta_list.tokens.clone()) {
-                    Ok(sibling_config) => {
-                        config.event_types.extend(sibling_config.event_types);
-                        if sibling_config.poll_interval_ms.is_some() {
-                            if config.poll_interval_ms.is_some() {
-                                return syn::Error::new_spanned(
-                                    attr,
-                                    "Conflicting poll_interval in multiple #[processor] attributes",
-                                )
-                                .to_compile_error()
-                                .into();
-                            }
-                            config.poll_interval_ms = sibling_config.poll_interval_ms;
+        if attr.path().is_ident("processor")
+            && let Meta::List(meta_list) = &attr.meta
+        {
+            match parse_processor_config(meta_list.tokens.clone()) {
+                Ok(sibling_config) => {
+                    config.event_types.extend(sibling_config.event_types);
+                    if sibling_config.poll_interval_ms.is_some() {
+                        if config.poll_interval_ms.is_some() {
+                            return syn::Error::new_spanned(
+                                attr,
+                                "Conflicting poll_interval in multiple #[processor] attributes",
+                            )
+                            .to_compile_error()
+                            .into();
                         }
+                        config.poll_interval_ms = sibling_config.poll_interval_ms;
                     }
-                    Err(err) => return err.into(),
                 }
+                Err(err) => return err.into(),
             }
         }
     }
+
+    // Deduplicate event types that may appear in multiple sibling #[processor] attributes
+    config.event_types.retain({
+        let mut seen = std::collections::HashSet::new();
+        move |path| seen.insert(quote!(#path).to_string())
+    });
 
     // Validate that subscribe list is not empty
     if config.event_types.is_empty() {

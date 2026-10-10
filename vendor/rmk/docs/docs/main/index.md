@@ -6,7 +6,7 @@ hero:
   text: A feature-rich Rust keyboard firmware
   tagline: Join our Discord server for discussions, support, and community collaboration!
   image:
-    src: /rmk_logo.svg
+    src: /logo.svg
     alt: RMK Logo
   actions:
     - theme: brand
@@ -22,7 +22,7 @@ features:
     icon: 🖥️
 
   - title: Real-time Keymap Configuration
-    details: Native Vial support, enabling real-time keymap modification
+    details: Real-time keymap modification via Vial (enabled by default) or RMK's native Rynk protocol (experimental)
     icon: 🧪
 
   - title: Advanced Features

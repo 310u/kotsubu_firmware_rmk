@@ -9,15 +9,37 @@ pub struct Behavior {
     pub macros: Option<Macros>,
     pub forks: Option<Forks>,
     pub morse: Option<Morse>,
+    pub auto_mouse_layer: Vec<AutoMouseLayer>,
 }
+
+pub struct AutoMouseLayer {
+    pub device_id: Option<u8>,
+    pub target_layer: u8,
+    pub timeout_ms: u64,
+    pub threshold: u16,
+    pub deactivate_on_key: bool,
+    pub extra_mouse_keys: Vec<String>,
+    pub reset_timeout_on_key: bool,
+}
+
+/// Default idle timeout (in milliseconds) for [`AutoMouseLayer`] when not specified in `keyboard.toml`.
+pub const DEFAULT_AUTO_MOUSE_LAYER_TIMEOUT_MS: u64 = 500;
+
+/// Default motion threshold for [`AutoMouseLayer`] when not specified.
+pub const DEFAULT_AUTO_MOUSE_LAYER_THRESHOLD: u16 = 1;
+
+/// Fallback for `auto_mouse_layer_max_num` when no `keyboard.toml` is loaded.
+pub const DEFAULT_AUTO_MOUSE_LAYER_MAX_NUM: usize = 2;
 
 pub struct OneShot {
     pub activate_on_keypress: Option<bool>,
+    pub quick_release: Option<bool>,
 }
 
 pub struct Combos {
     pub combos: Vec<Combo>,
     pub timeout_ms: Option<u64>,
+    pub prior_idle_time_ms: Option<u64>,
 }
 
 pub struct Combo {
@@ -68,12 +90,14 @@ pub struct Morse {
 
 #[derive(Clone)]
 pub struct MorseProfile {
+    pub enable_flow_tap: Option<bool>,
     pub unilateral_tap: Option<bool>,
     pub permissive_hold: Option<bool>,
     pub hold_on_other_press: Option<bool>,
     pub normal_mode: Option<bool>,
     pub hold_timeout_ms: Option<u64>,
     pub gap_timeout_ms: Option<u64>,
+    pub quick_tap_timeout_ms: Option<u64>,
 }
 
 pub struct MorseKey {
@@ -103,6 +127,7 @@ impl crate::KeyboardTomlConfig {
 
         let one_shot_modifiers = toml_behavior.one_shot_modifiers.map(|o| OneShot {
             activate_on_keypress: o.activate_on_keypress,
+            quick_release: o.quick_release,
         });
 
         let combos = toml_behavior.combo.map(|c| Combos {
@@ -116,6 +141,7 @@ impl crate::KeyboardTomlConfig {
                 })
                 .collect(),
             timeout_ms: c.timeout.map(|t| t.0),
+            prior_idle_time_ms: c.prior_idle_time.map(|t| t.0),
         });
 
         let macros = toml_behavior.macros.map(|m| Macros {
@@ -155,13 +181,17 @@ impl crate::KeyboardTomlConfig {
                 })
                 .unwrap_or_default();
 
+            // Seeded rather than left `None` so the switch is stored and read
+            // back over Rynk like the profile's other fields.
             let default_profile = MorseProfile {
+                enable_flow_tap: Some(m.enable_flow_tap.unwrap_or(false)),
                 unilateral_tap: m.unilateral_tap,
                 permissive_hold: m.permissive_hold,
                 hold_on_other_press: m.hold_on_other_press,
                 normal_mode: m.normal_mode,
                 hold_timeout_ms: Some(m.hold_timeout.as_ref().map(|t| t.0).unwrap_or(250)),
                 gap_timeout_ms: Some(m.gap_timeout.as_ref().map(|t| t.0).unwrap_or(250)),
+                quick_tap_timeout_ms: m.quick_tap_timeout.as_ref().map(|t| t.0),
             };
 
             let morses = m
@@ -197,6 +227,33 @@ impl crate::KeyboardTomlConfig {
             }
         });
 
+        // Named profiles are interned into the fixed-capacity morse profile
+        // table; overflowing it would silently drop profiles at runtime.
+        if let Some(m) = &morse
+            && m.profiles.len() > self.rmk.morse_profile_max_num
+        {
+            return Err(format!(
+                "behavior.morse.profiles defines {} profiles, but `[rmk] morse_profile_max_num` is {}. Raise it in keyboard.toml",
+                m.profiles.len(),
+                self.rmk.morse_profile_max_num
+            ));
+        }
+
+        let auto_mouse_layer = toml_behavior
+            .auto_mouse_layer
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| AutoMouseLayer {
+                device_id: a.device_id,
+                target_layer: a.target_layer,
+                timeout_ms: a.timeout.map(|t| t.0).unwrap_or(DEFAULT_AUTO_MOUSE_LAYER_TIMEOUT_MS),
+                threshold: a.threshold.unwrap_or(DEFAULT_AUTO_MOUSE_LAYER_THRESHOLD),
+                deactivate_on_key: a.deactivate_on_key.unwrap_or(false),
+                extra_mouse_keys: a.extra_mouse_keys.unwrap_or_default(),
+                reset_timeout_on_key: a.reset_timeout_on_key.unwrap_or(false),
+            })
+            .collect();
+
         Ok(Behavior {
             tri_layer,
             one_shot_timeout_ms,
@@ -205,6 +262,7 @@ impl crate::KeyboardTomlConfig {
             macros,
             forks,
             morse,
+            auto_mouse_layer,
         })
     }
 }
@@ -223,11 +281,106 @@ fn resolve_macro_operation(op: crate::MacroOperation) -> MacroOperation {
 
 fn resolve_morse_profile(p: &crate::MorseProfile) -> MorseProfile {
     MorseProfile {
+        enable_flow_tap: p.enable_flow_tap,
         unilateral_tap: p.unilateral_tap,
         permissive_hold: p.permissive_hold,
         hold_on_other_press: p.hold_on_other_press,
         normal_mode: p.normal_mode,
         hold_timeout_ms: p.hold_timeout.as_ref().map(|t| t.0),
         gap_timeout_ms: p.gap_timeout.as_ref().map(|t| t.0),
+        quick_tap_timeout_ms: p.quick_tap_timeout.as_ref().map(|t| t.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::KeyboardTomlConfig;
+
+    #[test]
+    fn morse_profile_enable_flow_tap_resolves_as_override() {
+        let toml = r#"
+[layout]
+rows = 1
+cols = 1
+map = "(0,0)"
+
+[keymap]
+layers = 1
+
+[[keymap.layer]]
+keys = "A"
+
+[behavior.morse]
+enable_flow_tap = true
+
+[behavior.morse.profiles.flow_on]
+enable_flow_tap = true
+
+[behavior.morse.profiles.flow_off]
+enable_flow_tap = false
+
+[behavior.morse.profiles.inherit]
+hold_timeout = "200ms"
+"#;
+
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("rmk-config-flow-tap-{}-{}.toml", std::process::id(), unique));
+
+        fs::write(&path, toml).unwrap();
+        let config = KeyboardTomlConfig::new_from_toml_path_with_event_defaults(&path);
+        let _ = fs::remove_file(&path);
+
+        let behavior = config.behavior().unwrap();
+        let morse = behavior.morse.unwrap();
+        assert!(morse.enable_flow_tap);
+        assert_eq!(morse.default_profile.enable_flow_tap, Some(true));
+        assert_eq!(morse.profiles["flow_on"].enable_flow_tap, Some(true));
+        assert_eq!(morse.profiles["flow_off"].enable_flow_tap, Some(false));
+        assert_eq!(morse.profiles["inherit"].enable_flow_tap, None);
+    }
+
+    #[test]
+    fn morse_profiles_overflowing_morse_profile_max_num_is_an_error() {
+        let toml = r#"
+[rmk]
+morse_profile_max_num = 1
+
+[layout]
+rows = 1
+cols = 1
+map = "(0,0)"
+
+[keymap]
+layers = 1
+
+[[keymap.layer]]
+keys = "A"
+
+[behavior.morse.profiles.p1]
+hold_timeout = "200ms"
+
+[behavior.morse.profiles.p2]
+hold_timeout = "300ms"
+"#;
+
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rmk-config-profile-overflow-{}-{}.toml",
+            std::process::id(),
+            unique
+        ));
+
+        fs::write(&path, toml).unwrap();
+        let config = KeyboardTomlConfig::new_from_toml_path_with_event_defaults(&path);
+        let _ = fs::remove_file(&path);
+
+        let err = match config.behavior() {
+            Ok(_) => panic!("expected the profile-overflow error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("morse_profile_max_num"), "unexpected error: {err}");
     }
 }

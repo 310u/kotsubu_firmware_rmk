@@ -11,35 +11,62 @@
 //!
 //! - `input`: Input events (keyboard, modifier, pointing device)
 //! - `state`: Keyboard state events (layer, WPM, LED indicator, sleep)
-//! - `battery`: Battery events (ADC, charging, battery state)
+//! - `battery`: Battery events (ADC, charging, battery status)
 //! - `connection`: Connection events (USB/BLE, BLE status)
 //! - `split`: Split keyboard events (peripheral/central connection)
 
 use embassy_sync::blocking_mutex::raw::RawMutex;
-use embassy_sync::pubsub::{ImmediatePublisher, Publisher, Subscriber};
+use embassy_sync::pubsub::{Error as PubSubError, ImmediatePublisher, Publisher, Subscriber};
 use embassy_sync::{channel, watch};
+
+/// Generates `Deref`, `From<Event> for Payload`, and `From<Payload> for Event`
+/// for a newtype event struct wrapping a payload.
+macro_rules! impl_payload_wrapper {
+    ($event:ty, $payload:ty) => {
+        impl core::ops::Deref for $event {
+            type Target = $payload;
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        impl From<$event> for $payload {
+            fn from(event: $event) -> Self {
+                event.0
+            }
+        }
+
+        impl From<$payload> for $event {
+            fn from(payload: $payload) -> Self {
+                Self(payload)
+            }
+        }
+    };
+}
 
 mod action;
 mod battery;
 mod connection;
+#[cfg(feature = "dfu")]
+mod dfu;
 mod input;
 #[cfg(feature = "split")]
 mod split;
 mod state;
 
 pub use action::ActionEvent;
-pub use battery::{BatteryAdcEvent, BatteryStateEvent, ChargingStateEvent};
-#[cfg(feature = "_ble")]
-pub use connection::BleStatusChangeEvent;
-pub use connection::{ConnectionChangeEvent, ConnectionType};
+pub use battery::{BatteryAdcEvent, BatteryStatusEvent, ChargingStateEvent};
+pub use connection::{ConnectionStatus, ConnectionStatusChangeEvent, ConnectionType};
+#[cfg(feature = "dfu")]
+pub use dfu::DfuStatusEvent;
 pub use input::{
     Axis, AxisEvent, AxisValType, KeyPos, KeyboardEvent, KeyboardEventPos, ModifierEvent, PointingEvent,
-    PointingSetCpiEvent, RotaryEncoderPos,
+    PointingProcessorEvent, PointingSetCpiEvent, RotaryEncoderPos,
 };
-#[cfg(feature = "split")]
-pub use split::{CentralConnectedEvent, PeripheralConnectedEvent};
 #[cfg(all(feature = "split", feature = "_ble"))]
-pub use split::{ClearPeerEvent, PeripheralBatteryEvent};
+pub use split::ClearPeerEvent;
+#[cfg(feature = "split")]
+pub use split::{CentralConnectedEvent, PeripheralBatteryEvent, PeripheralConnectedEvent};
 pub use state::{LayerChangeEvent, LedIndicatorEvent, SleepStateEvent, WpmUpdateEvent};
 
 /// Trait for event publishers
@@ -74,7 +101,9 @@ pub trait PublishableEvent: Clone + Send {
 pub trait AsyncPublishableEvent: PublishableEvent {
     type AsyncPublisher: AsyncEventPublisher<Event = Self>;
 
-    fn publisher_async() -> Self::AsyncPublisher;
+    /// Errors when all `pubs` waker slots are taken, which happens only while
+    /// the channel is full and `pubs` publishers are blocked on it.
+    fn publisher_async() -> Result<Self::AsyncPublisher, PubSubError>;
 }
 
 /// Trait for events that can be subscribed to.
@@ -181,6 +210,20 @@ pub fn publish_event<E: PublishableEvent>(e: E) {
 /// Example: `publish_event_async(KeyboardEvent::key(0, 0, true)).await`
 pub async fn publish_event_async<E: AsyncPublishableEvent>(e: E) {
     if !E::PUBLISH_IS_NOOP {
-        E::publisher_async().publish_async(e).await;
+        let publisher = match E::publisher_async() {
+            Ok(p) => p,
+            Err(_) => {
+                // All `pubs` waker slots are held by publishers blocked on a full
+                // channel; there is no waker for a freed slot, so poll briefly.
+                warn!("publisher slots exhausted, consider raising [event] pubs in keyboard.toml");
+                loop {
+                    embassy_time::Timer::after_millis(1).await;
+                    if let Ok(p) = E::publisher_async() {
+                        break p;
+                    }
+                }
+            }
+        };
+        publisher.publish_async(e).await;
     }
 }

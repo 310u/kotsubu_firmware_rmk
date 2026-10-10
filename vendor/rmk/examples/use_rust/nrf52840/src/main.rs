@@ -19,12 +19,13 @@ use keymap::{COL, ROW};
 use panic_probe as _;
 use rmk::config::{BehaviorConfig, PositionalConfig, RmkConfig, StorageConfig, VialConfig};
 use rmk::debounce::default_debouncer::DefaultDebouncer;
-use rmk::futures::future::join3;
-use rmk::input_device::Runnable;
+use rmk::host::HostService;
 use rmk::keyboard::Keyboard;
 use rmk::matrix::Matrix;
+use rmk::processor::builtin::wpm::WpmProcessor;
 use rmk::storage::async_flash_wrapper;
-use rmk::{KeymapData, initialize_keymap_and_storage, run_all, run_rmk};
+use rmk::usb::UsbTransport;
+use rmk::{KeymapData, initialize_keymap_and_storage, run_all};
 use vial::{VIAL_KEYBOARD_DEF, VIAL_KEYBOARD_ID};
 
 bind_interrupts!(struct Irqs {
@@ -80,12 +81,11 @@ async fn main(_spawner: Spawner) {
     let debouncer = DefaultDebouncer::new();
     let mut matrix = Matrix::<_, _, _, ROW, COL, true>::new(row_pins, col_pins, debouncer);
     let mut keyboard = Keyboard::new(&keymap);
+    let host_service = HostService::new(&keymap, &rmk_config);
+
+    let mut usb_transport = UsbTransport::new(driver, rmk_config.device_config).with_host_service(&host_service);
+    let mut wpm_processor = WpmProcessor::new();
 
     // Start
-    join3(
-        run_all!(matrix),
-        keyboard.run(),
-        run_rmk(&keymap, driver, &mut storage, rmk_config),
-    )
-    .await;
+    run_all!(matrix, storage, usb_transport, wpm_processor, keyboard).await;
 }

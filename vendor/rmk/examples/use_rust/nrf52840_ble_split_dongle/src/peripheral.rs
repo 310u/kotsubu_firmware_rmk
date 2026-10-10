@@ -17,17 +17,15 @@ use nrf_mpsl::Flash;
 use nrf_sdc::mpsl::MultiprotocolServiceLayer;
 use nrf_sdc::{self as sdc, mpsl};
 use panic_probe as _;
-use rand_chacha::ChaCha12Rng;
-use rand_core::SeedableRng;
-use rmk::ble::build_ble_stack;
 use rmk::config::StorageConfig;
 use rmk::debounce::default_debouncer::DefaultDebouncer;
 use rmk::futures::future::join;
 use rmk::input_device::rotary_encoder::RotaryEncoder;
 use rmk::matrix::Matrix;
+use rmk::run_all;
 use rmk::split::peripheral::run_rmk_split_peripheral;
-use rmk::storage::new_storage_for_split_peripheral;
-use rmk::{HostResources, run_all};
+use rmk::storage::new_storage_without_keymap;
+use rmk::watchdog::Nrf52Watchdog;
 use static_cell::StaticCell;
 
 bind_interrupts!(struct Irqs {
@@ -104,7 +102,8 @@ async fn main(spawner: Spawner) {
         source: mpsl::raw::MPSL_CLOCK_LF_SRC_RC as u8,
         rc_ctiv: mpsl::raw::MPSL_RECOMMENDED_RC_CTIV as u8,
         rc_temp_ctiv: mpsl::raw::MPSL_RECOMMENDED_RC_TEMP_CTIV as u8,
-        accuracy_ppm: mpsl::raw::MPSL_DEFAULT_CLOCK_ACCURACY_PPM as u16,
+
+        accuracy_ppm: 500,
         skip_wait_lfclk_started: mpsl::raw::MPSL_DEFAULT_SKIP_WAIT_LFCLK_STARTED != 0,
     };
     static MPSL: StaticCell<MultiprotocolServiceLayer> = StaticCell::new();
@@ -121,12 +120,8 @@ async fn main(spawner: Spawner) {
         p.PPI_CH27, p.PPI_CH28, p.PPI_CH29,
     );
     let mut rng = rng::Rng::new(p.RNG, Irqs);
-    let mut rng_generator = ChaCha12Rng::from_rng(&mut rng).unwrap();
     let mut sdc_mem = sdc::Mem::<4624>::new();
     let sdc = unwrap!(build_sdc(sdc_p, &mut rng, mpsl, &mut sdc_mem));
-
-    let mut resources = HostResources::new();
-    let stack = build_ble_stack(sdc, ble_addr(), &mut rng_generator, &mut resources).await;
 
     // Initialize the ADC. We are only using one channel for detecting battery level
     let adc_pin = p.P0_05.degrade_saadc();
@@ -144,7 +139,7 @@ async fn main(spawner: Spawner) {
         ..Default::default()
     };
     let flash = Flash::take(mpsl, p.NVMC);
-    let mut storage = new_storage_for_split_peripheral(flash, storage_config).await;
+    let mut storage = new_storage_without_keymap(flash, storage_config).await;
 
     // Initialize the peripheral matrix
     let debouncer = DefaultDebouncer::new();
@@ -155,10 +150,12 @@ async fn main(spawner: Spawner) {
     let pin_b = Input::new(p.P1_04, embassy_nrf::gpio::Pull::None);
     let mut encoder = RotaryEncoder::with_resolution(pin_a, pin_b, 4, true, 1);
 
+    let mut watchdog_runner = Nrf52Watchdog::default_runner(p.WDT);
+
     // Start
     join(
-        run_all!(matrix, encoder),
-        run_rmk_split_peripheral(0, &stack, &mut storage),
+        run_all!(matrix, encoder, storage, watchdog_runner),
+        run_rmk_split_peripheral(0, sdc, ble_addr()),
     )
     .await;
 }

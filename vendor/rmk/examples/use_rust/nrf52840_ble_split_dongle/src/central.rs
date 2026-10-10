@@ -21,16 +21,12 @@ use nrf_mpsl::Flash;
 use nrf_sdc::mpsl::MultiprotocolServiceLayer;
 use nrf_sdc::{self as sdc, mpsl};
 use panic_probe as _;
-use rand_chacha::ChaCha12Rng;
-use rand_core::SeedableRng;
-use rmk::ble::build_ble_stack;
-use rmk::builtin_processor::led_indicator::KeyboardIndicatorProcessor;
+use rmk::ble::BleTransport;
 use rmk::config::{
     BehaviorConfig, BleBatteryConfig, DeviceConfig, PositionalConfig, RmkConfig, StorageConfig, VialConfig,
 };
 use rmk::debounce::default_debouncer::DefaultDebouncer;
-use rmk::futures::future::{join, join4};
-use rmk::input_device::Runnable;
+use rmk::host::HostService;
 use rmk::input_device::adc::{AnalogEventType, NrfAdc};
 use rmk::input_device::battery::BatteryProcessor;
 use rmk::input_device::pmw3610::{BitBangSpiBus, Pmw3610, Pmw3610Config};
@@ -38,9 +34,12 @@ use rmk::input_device::pointing::{PointingDevice, PointingProcessor, PointingPro
 use rmk::input_device::rotary_encoder::RotaryEncoder;
 use rmk::keyboard::Keyboard;
 use rmk::matrix::Matrix;
-use rmk::split::ble::central::{read_peripheral_addresses, scan_peripherals};
-use rmk::split::central::run_peripheral_manager;
-use rmk::{HostResources, KeymapData, initialize_keymap_and_storage, run_all, run_rmk};
+use rmk::processor::builtin::led_indicator::KeyboardIndicatorProcessor;
+use rmk::processor::builtin::wpm::WpmProcessor;
+use rmk::split::PeripheralMatrixConfig;
+use rmk::usb::UsbTransport;
+use rmk::watchdog::Nrf52Watchdog;
+use rmk::{KeymapData, initialize_keymap_and_storage, run_all};
 use static_cell::StaticCell;
 use vial::{VIAL_KEYBOARD_DEF, VIAL_KEYBOARD_ID};
 
@@ -123,7 +122,8 @@ async fn main(spawner: Spawner) {
         source: mpsl::raw::MPSL_CLOCK_LF_SRC_RC as u8,
         rc_ctiv: mpsl::raw::MPSL_RECOMMENDED_RC_CTIV as u8,
         rc_temp_ctiv: mpsl::raw::MPSL_RECOMMENDED_RC_TEMP_CTIV as u8,
-        accuracy_ppm: mpsl::raw::MPSL_DEFAULT_CLOCK_ACCURACY_PPM as u16,
+
+        accuracy_ppm: 500,
         skip_wait_lfclk_started: mpsl::raw::MPSL_DEFAULT_SKIP_WAIT_LFCLK_STARTED != 0,
     };
     static MPSL: StaticCell<MultiprotocolServiceLayer> = StaticCell::new();
@@ -140,11 +140,8 @@ async fn main(spawner: Spawner) {
         p.PPI_CH27, p.PPI_CH28, p.PPI_CH29,
     );
     let mut rng = rng::Rng::new(p.RNG, Irqs);
-    let mut rng_gen = ChaCha12Rng::from_rng(&mut rng).unwrap();
     let mut sdc_mem = sdc::Mem::<15472>::new();
     let sdc = unwrap!(build_sdc(sdc_p, &mut rng, mpsl, &mut sdc_mem));
-    let mut host_resources = HostResources::new();
-    let stack = build_ble_stack(sdc, ble_addr(), &mut rng_gen, &mut host_resources).await;
 
     // Initialize usb driver
     let driver = Driver::new(p.USBD, Irqs, HardwareVbusDetect::new(Irqs));
@@ -169,7 +166,7 @@ async fn main(spawner: Spawner) {
         pid: 0x4643,
         manufacturer: "Haobo",
         product_name: "RMK Keyboard",
-        serial_number: "vial:f64c2b3c:000001",
+        ..DeviceConfig::default()
     };
     let vial_config = VialConfig::new(VIAL_KEYBOARD_ID, VIAL_KEYBOARD_DEF, &[(0, 0), (1, 1)]);
     let ble_battery_config = BleBatteryConfig::new(Some(is_charging_pin), true, None, false);
@@ -210,9 +207,7 @@ async fn main(spawner: Spawner) {
     let mut matrix = Matrix::<_, _, _, 4, 7, true>::new(row_pins, col_pins, debouncer);
     // let mut matrix = TestMatrix::<ROW, COL>::new();
     let mut keyboard = Keyboard::new(&keymap);
-
-    // Read peripheral address from storage
-    let peripheral_addrs = read_peripheral_addresses::<2, _, 8, 7, 4, 2>(&mut storage).await;
+    let host_service = HostService::new(&keymap, &rmk_config);
 
     // Initialize pointing device
     let pmw3610_config = Pmw3610Config {
@@ -241,6 +236,7 @@ async fn main(spawner: Spawner) {
     let mut adc_device = NrfAdc::new(
         saadc,
         [AnalogEventType::Battery],
+        [0],
         embassy_time::Duration::from_secs(12),
         None,
     );
@@ -257,24 +253,47 @@ async fn main(spawner: Spawner) {
         rmk::types::led_indicator::LedIndicatorType::CapsLock,
     );
 
+    let mut usb_transport = UsbTransport::new(driver, rmk_config.device_config).with_host_service(&host_service);
+    // Two peripheral halves, both 4x7 at row offset 4.
+    let mut ble_transport = BleTransport::new(
+        sdc,
+        ble_addr(),
+        rmk_config,
+        [
+            PeripheralMatrixConfig {
+                rows: 4,
+                cols: 7,
+                row_offset: 4,
+                col_offset: 0,
+            },
+            PeripheralMatrixConfig {
+                rows: 4,
+                cols: 7,
+                row_offset: 4,
+                col_offset: 0,
+            },
+        ],
+    )
+    .with_host_service(&host_service);
+    let mut wpm_processor = WpmProcessor::new();
+
+    let mut watchdog_runner = Nrf52Watchdog::default_runner(p.WDT);
+
     // Start
-    join4(
-        async {},
-        run_all!(
-            matrix,
-            encoder,
-            pmw3610_device,
-            adc_device,
-            batt_proc,
-            pointing_processor
-        ),
-        join(keyboard.run(), capslock_led.run()),
-        join4(
-            scan_peripherals(&stack, &peripheral_addrs),
-            run_peripheral_manager::<4, 7, 4, 0, _>(0, &peripheral_addrs, &stack),
-            run_peripheral_manager::<4, 7, 4, 0, _>(1, &peripheral_addrs, &stack),
-            run_rmk(&keymap, driver, &stack, &mut storage, rmk_config),
-        ),
+    run_all!(
+        matrix,
+        encoder,
+        pmw3610_device,
+        adc_device,
+        batt_proc,
+        pointing_processor,
+        storage,
+        usb_transport,
+        ble_transport,
+        wpm_processor,
+        keyboard,
+        capslock_led,
+        watchdog_runner
     )
     .await;
 }

@@ -23,20 +23,20 @@ There are a bunch of things to do with RMK in the near future. I plan to ship 1.
 - [ ] NKRO
 - [x] 🔵 Input device
   - [x] 🟢 Encoder
-  - [ ] 🔴 Mouse
-  - [ ] 🔴 Trackball
-  - [ ] 🔴 Trackpad
+  - [x] 🔴 Mouse
+  - [x] 🔴 Trackball
+  - [x] 🔴 Trackpad
 - [x] 🔴 Basic Macro support
   - [x] 🔴 Macro definition via Rust
   - [x] 🔴 Unicode and umlaute support
-- [ ] Macro support enhancement
-  - [ ] 🟢 Macro definition via toml
+- [x] Macro support enhancement
+  - [x] 🟢 Macro definition via toml
   - [x] 🟢 Make macro storage space configurable
-- [ ] 🔴 Tap dance
-- [ ] 🔵 Controller device
-  - [ ] External power control(GPIO)
+- [x] 🔴 Tap dance
+- [x] 🔵 Processor (output devices)
+  - [x] External power control(GPIO)
   - [ ] 🔴 RGB
-  - [ ] 🔴 Display support
+  - [x] 🔴 Display support
 
 #### Wireless
 
@@ -49,10 +49,10 @@ There are a bunch of things to do with RMK in the near future. I plan to ship 1.
 - [x] Stabilizing BLE feature gate/API
 - [x] Support more MCUs, such as cyw(used in rp2040w/rp2350w)
 - [ ] Deep-sleep mode
-- [ ] Better support for dongle
+- [x] Better support for split dongle (dongle as the split central)
 - [ ] Nordic Uart HCI support
 - [ ] Send report via Uart/Usart
-- [ ] Switch between dongle mode and BLE mode
+- [x] 🔵 Tri-mode dongle: switch between USB, BLE and dongle mode
 
 #### User experience
 
@@ -62,7 +62,10 @@ There are a bunch of things to do with RMK in the near future. I plan to ship 1.
 - [x] Versioned documentation site, better documentation
 - [ ] Making vial and default keymap consistent automatically
 - [ ] 🔴🔵 GUI keymap configurator which supports windows/macos/linux/web
-- [ ] Default bootloader
-- [ ] USB DFU/OTA
+- [x] Default bootloader
+- [x] USB DFU
+- [x] Flashing peripherals from the central via uart
+- [ ] Flashing peripherals from the central via ble
+- [ ] OTA updates
 
 If you want to contribute, please feel free to open an issue or PR, or just ping me! Any forms of contribution are welcome :D

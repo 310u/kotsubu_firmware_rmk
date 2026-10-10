@@ -3,22 +3,17 @@
 //! This module defines the `InputDevice` trait, `Runnable` trait and several macros for running input devices and processors.
 //! The `InputDevice` trait provides the interface for individual input devices, and the macros facilitate their concurrent execution.
 
+use crate::core_traits::Runnable;
+
 pub mod adc;
 #[cfg(feature = "_ble")]
 pub mod battery;
+pub mod iqs5xx;
 pub mod joystick;
 pub mod pmw33xx;
 pub mod pmw3610;
 pub mod pointing;
 pub mod rotary_encoder;
-
-/// The trait for runnable input devices and processors.
-///
-/// For some input devices or processors, they should keep running in a separate task.
-/// This trait is used to run them in a separate task.
-pub trait Runnable {
-    async fn run(&mut self) -> !;
-}
 
 /// The trait for input devices.
 ///
@@ -67,10 +62,11 @@ pub trait InputDevice: Runnable {
     async fn read_event(&mut self) -> Self::Event;
 }
 
-/// Macro to run multiple Runnable instances concurrently.
+/// Run multiple tasks concurrently by calling each task's `run` method.
 ///
-/// This macro simplifies running multiple input devices and processors
-/// that implement the `Runnable` trait.
+/// The `Runnable` trait is brought into scope for input devices and
+/// processors. Types with an inherent `run` method, such as `BleTransport`,
+/// can be included without implementing `Runnable`.
 ///
 /// # Example
 /// ```rust
@@ -83,8 +79,8 @@ pub trait InputDevice: Runnable {
 /// ```
 #[macro_export]
 macro_rules! run_all {
-    ($( $dev:ident ),*) => {{
-        use $crate::input_device::Runnable;
+    ($( $dev:ident ),* $(,)*) => {{
+        use $crate::core_traits::Runnable as _;
         $crate::join_all!(
             $(
                 $dev.run()

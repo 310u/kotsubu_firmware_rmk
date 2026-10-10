@@ -11,16 +11,20 @@ mod my_keyboard {
     use embassy_stm32::Config;
     use embassy_stm32::time::Hertz;
     use embassy_stm32::usb::Driver;
-    use rmk::futures::future::join3;
-    use rmk::input_device::Runnable;
-    use rmk::{run_all, run_rmk};
+    use rmk::processor::builtin::wpm::WpmProcessor;
+    use rmk::run_all;
+    use rmk::usb::UsbTransport;
     use static_cell::StaticCell;
 
-    // If you want customize interrupte binding , use `#[Override(bind_interrupt)]` to override default interrupt binding
+    // If you want customize interrupte binding , use `#[Override(bind_interrupt)]` to override default interrupt binding.
+    // The override replaces the whole generated `bind_interrupts!` block, so it has to bind
+    // everything this configuration needs (here: USB, plus the EXTI lines used by `async_matrix`).
     #[Override(bind_interrupt)]
     fn bind_interrupt() {
-        bind_interrupts!(struct Irqs {
-            OTG_HS => InterruptHandler<USB_OTG_HS>;
+        embassy_stm32::bind_interrupts!(struct Irqs {
+            OTG_HS => embassy_stm32::usb::InterruptHandler<embassy_stm32::peripherals::USB_OTG_HS>;
+            EXTI9_5 => embassy_stm32::exti::InterruptHandler<embassy_stm32::interrupt::typelevel::EXTI9_5>;
+            EXTI15_10 => embassy_stm32::exti::InterruptHandler<embassy_stm32::interrupt::typelevel::EXTI15_10>;
         });
     }
 
@@ -81,13 +85,10 @@ mod my_keyboard {
     // Use `#[Override(entry)]` to override default rmk keyboard runner
     #[Override(entry)]
     fn run() {
+        let mut usb_transport = UsbTransport::new(driver, rmk_config.device_config).with_host_service(&host_service);
+        let mut wpm_processor = WpmProcessor::new();
+
         // Start
-        join3(
-            run_all!(matrix),
-            keyboard.run(),
-            // run_rmk(&keymap, driver, &mut storage, rmk_config),
-            run_rmk(&keymap, driver, rmk_config),
-        )
-        .await;
+        run_all!(matrix, usb_transport, wpm_processor, keyboard).await;
     }
 }

@@ -1,11 +1,11 @@
 use embassy_time::{Duration, Instant};
-use rmk_types::action::{Action, KeyAction, MorseMode};
+use rmk_types::action::{Action, KeyAction};
+use rmk_types::morse::{HOLD, MorseMode, MorsePattern, TAP};
 
 use crate::event::KeyboardEvent;
 use crate::keyboard::Keyboard;
 use crate::keyboard::held_buffer::{HeldKey, KeyState};
 use crate::keymap::KeyMap;
-use crate::morse::{HOLD, MorsePattern, TAP};
 
 // 'morse' is an alias for the superset of tap dance and tap hold keys, since their handling have many similarities
 impl<'a> Keyboard<'a> {
@@ -47,36 +47,52 @@ impl<'a> Keyboard<'a> {
             _ => unreachable!(),
         };
 
-        // If there's still morse key in the held buffer, don't fire normal keys
-        // FIXME? is |Holding needed here?
-        if self
-            .held_buffer
-            .keys
-            .iter()
-            .any(|k| k.action.is_morse() && matches!(k.state, KeyState::Pressed(_)))
-        {
-            return; //?
+        // If there's still an unresolved morse key in the held buffer, don't fire normal keys.
+        if self.has_unresolved_morse_key() {
+            return;
         }
 
         self.fire_held_non_morse_keys().await;
     }
 
-    pub(crate) async fn process_key_action_morse(&mut self, key_action: &KeyAction, event: KeyboardEvent) {
+    pub(crate) async fn process_key_action_morse(
+        &mut self,
+        key_action: &KeyAction,
+        event: KeyboardEvent,
+        event_time: Instant,
+    ) {
         debug!("Processing morse keys: {:?}", event);
         assert!(key_action.is_morse());
 
         // Process the morse key
         if event.pressed {
             // Pressed, check the held buffer, update the tap state
-            let pressed_time = self.get_timer_value(event).unwrap_or(Instant::now());
-            let timeout_time = pressed_time + Self::morse_timeout(self.keymap, key_action, true);
+            let timeout_time = event_time + Self::morse_timeout(self.keymap, key_action, true);
             match self.held_buffer.find_pos_mut(event.pos) {
                 Some(k) => {
                     // The current key is already in the buffer, update its state
                     match k.state {
                         KeyState::Released(pattern) | KeyState::EarlyFired(pattern) => {
+                            // `k.press_time` holds the *release* time while in Released/EarlyFired,
+                            // so the subtraction below measures "time since last release".
+                            if !pattern.is_empty()
+                                && pattern.is_all_taps()
+                                && let Some(window) = Self::quick_tap_window(self.keymap, key_action)
+                                && event_time.saturating_duration_since(k.press_time) <= window
+                            {
+                                let tap_action = Self::action_from_pattern(self.keymap, key_action, TAP);
+                                if tap_action != Action::No {
+                                    debug!("Quick-tap fire: {:?}", tap_action);
+                                    k.state = KeyState::ProcessedButReleaseNotReportedYet(tap_action);
+                                    k.press_time = event_time;
+                                    k.timeout_time = timeout_time;
+                                    self.process_key_action_normal(tap_action, event).await;
+                                    return;
+                                }
+                            }
+
                             k.state = KeyState::Pressed(pattern);
-                            k.press_time = pressed_time;
+                            k.press_time = event_time;
                             k.timeout_time = timeout_time;
                         }
                         _ => {}
@@ -88,7 +104,7 @@ impl<'a> Keyboard<'a> {
                         event,
                         *key_action,
                         KeyState::Pressed(MorsePattern::default()),
-                        pressed_time,
+                        event_time,
                         timeout_time,
                     ));
                 }
@@ -133,7 +149,30 @@ impl<'a> Keyboard<'a> {
                         };
 
                         let final_action = Self::try_predict_final_action(self.keymap, &k.action, pattern);
-                        if let Some(action) = final_action {
+
+                        if !hold
+                            && pattern.is_all_taps()
+                            && let Some(action) = final_action
+                            && action != Action::No
+                            && let Some(window) = Self::quick_tap_window(self.keymap, &k.action)
+                        {
+                            let stashed_action = k.action;
+                            debug!("Stash for quick-tap, fire {:?} immediately", action);
+                            let mut press_event = event;
+                            press_event.pressed = true;
+                            self.process_key_action_tap(action, press_event).await;
+                            let gap = Self::morse_timeout(self.keymap, &stashed_action, false);
+                            let keep_alive = gap.max(window);
+                            if let Some(k) = self.held_buffer.find_pos_mut(event.pos) {
+                                k.state = KeyState::EarlyFired(pattern);
+                                k.press_time = released_time;
+                                k.timeout_time = released_time + keep_alive;
+                            }
+                            self.held_buffer.keys.sort_unstable_by_key(|k| k.timeout_time);
+                            if !self.has_unresolved_morse_key() {
+                                self.fire_held_non_morse_keys().await;
+                            }
+                        } else if let Some(action) = final_action {
                             debug!("released prediction {:?} -> {:?}", pattern, action);
                             // Reached the longest configured morse pattern, trigger the corresponding action immediately
                             self.held_buffer.remove(event.pos); // Remove the key from the held buffer, is like setting to an idle state
@@ -168,6 +207,10 @@ impl<'a> Keyboard<'a> {
                                 if let Some(k) = self.held_buffer.find_pos_mut(event.pos) {
                                     k.state = KeyState::EarlyFired(pattern);
                                 }
+
+                                if !self.has_unresolved_morse_key() {
+                                    self.fire_held_non_morse_keys().await;
+                                }
                             }
                         }
                     }
@@ -187,8 +230,26 @@ impl<'a> Keyboard<'a> {
                         // Process the release action
                         debug!("[morse] Releasing morse key: {:?}", event);
                         self.process_key_action_normal(action, event).await;
-                        // Clear timer
-                        self.set_timer_value(event, None);
+                    }
+                    KeyState::FlowTapped(action) => {
+                        // Flow-tap fired the tap action and is holding it down; release it now.
+                        debug!("[morse] Releasing flow-tapped morse key: {:?}", event);
+                        self.process_key_action_normal(action, event).await;
+                        // If the key has a hold-after-tap action, keep it in the buffer as if it
+                        // had been early-fired so a re-press within the gap timeout continues into
+                        // hold-after-tap (the tap-then-hold repeat). Without this a flow-tapped
+                        // tap leaves no trace and the next press-and-hold resolves as a fresh hold.
+                        if Self::action_from_pattern(self.keymap, key_action, TAP.followed_by_hold()) != Action::No {
+                            let now = Instant::now();
+                            let timeout = Self::morse_timeout(self.keymap, key_action, false);
+                            if let Some(k) = self.held_buffer.find_pos_mut(event.pos) {
+                                k.state = KeyState::EarlyFired(TAP);
+                                k.press_time = now;
+                                k.timeout_time = now + timeout;
+                            }
+                        } else {
+                            let _ = self.held_buffer.remove(event.pos);
+                        }
                     }
                     _ => {}
                 };
@@ -213,6 +274,16 @@ impl<'a> Keyboard<'a> {
         self.held_buffer.keys.sort_unstable_by_key(|k| k.timeout_time);
     }
 
+    fn has_unresolved_morse_key(&self) -> bool {
+        self.held_buffer.keys.iter().any(|k| {
+            k.action.is_morse()
+                && matches!(
+                    k.state,
+                    KeyState::Pressed(_) | KeyState::Holding(_) | KeyState::Released(_)
+                )
+        })
+    }
+
     pub fn action_from_pattern(keymap: &KeyMap, keyAction: &KeyAction, pattern: MorsePattern) -> Action {
         match keyAction {
             KeyAction::TapHold(tap_action, hold_action, _) => match pattern {
@@ -228,10 +299,23 @@ impl<'a> Keyboard<'a> {
         }
     }
 
+    pub fn quick_tap_window(keymap: &KeyMap, key_action: &KeyAction) -> Option<Duration> {
+        let per_key = match key_action {
+            KeyAction::TapHold(_, _, idx) => keymap.morse_profile(*idx).quick_tap_timeout_ms(),
+            KeyAction::Morse(idx) => keymap
+                .get_morse(*idx as usize)
+                .and_then(|m| m.profile.quick_tap_timeout_ms()),
+            _ => None,
+        };
+        let timeout = per_key.or_else(|| keymap.morse_default_profile().quick_tap_timeout_ms());
+        timeout.filter(|&t| t > 0).map(|t| Duration::from_millis(t as u64))
+    }
+
     pub fn morse_timeout(keymap: &KeyMap, key_action: &KeyAction, hold_timeout_needed: bool) -> Duration {
         // Check per-key profile config first
         match key_action {
-            KeyAction::TapHold(_, _, profile) => {
+            KeyAction::TapHold(_, _, idx) => {
+                let profile = keymap.morse_profile(*idx);
                 let timeout = if hold_timeout_needed {
                     profile.hold_timeout_ms()
                 } else {
@@ -275,8 +359,8 @@ impl<'a> Keyboard<'a> {
     pub fn tap_hold_mode(keymap: &KeyMap, key_action: &KeyAction) -> MorseMode {
         // Check per-key profile config first
         match key_action {
-            KeyAction::TapHold(_, _, profile) => {
-                if let Some(mode) = profile.mode() {
+            KeyAction::TapHold(_, _, idx) => {
+                if let Some(mode) = keymap.morse_profile(*idx).mode() {
                     return mode;
                 }
             }
@@ -299,8 +383,8 @@ impl<'a> Keyboard<'a> {
     pub fn is_unilateral_tap_enabled(keymap: &KeyMap, key_action: &KeyAction) -> bool {
         // try to look for a per-key profile config
         match key_action {
-            KeyAction::TapHold(_, _, profile) => {
-                if let Some(enabled) = profile.unilateral_tap() {
+            KeyAction::TapHold(_, _, idx) => {
+                if let Some(enabled) = keymap.morse_profile(*idx).unilateral_tap() {
                     return enabled;
                 }
             }
@@ -316,6 +400,19 @@ impl<'a> Keyboard<'a> {
 
         // Use the global default
         keymap.morse_default_profile().unilateral_tap().unwrap_or(false)
+    }
+
+    pub fn is_flow_tap_enabled(keymap: &KeyMap, key_action: &KeyAction) -> bool {
+        let per_key = match key_action {
+            KeyAction::TapHold(_, _, idx) => keymap.morse_profile(*idx).enable_flow_tap(),
+            KeyAction::Morse(index) => keymap
+                .get_morse(*index as usize)
+                .and_then(|morse| morse.profile.enable_flow_tap()),
+            _ => None,
+        };
+        per_key
+            .or_else(|| keymap.morse_default_profile().enable_flow_tap())
+            .unwrap_or_else(|| keymap.morse_enable_flow_tap())
     }
 
     /// Checks if the given pattern can fire its action early even though longer

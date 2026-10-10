@@ -18,16 +18,15 @@ use nrf_mpsl::Flash;
 use nrf_sdc::mpsl::MultiprotocolServiceLayer;
 use nrf_sdc::{self as sdc, mpsl};
 use panic_probe as _;
-use rand_chacha::ChaCha12Rng;
-use rand_core::SeedableRng;
-use rmk::ble::build_ble_stack;
+use rmk::ble::BleTransport;
 use rmk::config::{BehaviorConfig, DeviceConfig, PositionalConfig, RmkConfig, StorageConfig, VialConfig};
 use rmk::debounce::default_debouncer::DefaultDebouncer;
-use rmk::futures::future::join3;
-use rmk::input_device::Runnable as _;
+use rmk::host::HostService;
 use rmk::keyboard::Keyboard;
 use rmk::matrix::Matrix;
-use rmk::{HostResources, KeymapData, initialize_keymap_and_storage, run_all, run_rmk};
+use rmk::processor::builtin::wpm::WpmProcessor;
+use rmk::watchdog::Nrf52Watchdog;
+use rmk::{KeymapData, initialize_keymap_and_storage, run_all};
 use static_cell::StaticCell;
 use vial::{VIAL_KEYBOARD_DEF, VIAL_KEYBOARD_ID};
 
@@ -89,7 +88,8 @@ async fn main(spawner: Spawner) {
         source: mpsl::raw::MPSL_CLOCK_LF_SRC_RC as u8,
         rc_ctiv: mpsl::raw::MPSL_RECOMMENDED_RC_CTIV as u8,
         rc_temp_ctiv: mpsl::raw::MPSL_RECOMMENDED_RC_TEMP_CTIV as u8,
-        accuracy_ppm: mpsl::raw::MPSL_DEFAULT_CLOCK_ACCURACY_PPM as u16,
+
+        accuracy_ppm: 500,
         skip_wait_lfclk_started: mpsl::raw::MPSL_DEFAULT_SKIP_WAIT_LFCLK_STARTED != 0,
     };
     static MPSL: StaticCell<MultiprotocolServiceLayer> = StaticCell::new();
@@ -106,11 +106,8 @@ async fn main(spawner: Spawner) {
         p.PPI_CH27, p.PPI_CH28, p.PPI_CH29,
     );
     let mut rng = rng::Rng::new(p.RNG, Irqs);
-    let mut rng_gen = ChaCha12Rng::from_rng(&mut rng).unwrap();
-    let mut sdc_mem = sdc::Mem::<3072>::new();
+    let mut sdc_mem = sdc::Mem::<4696>::new();
     let sdc = unwrap!(build_sdc(sdc_p, &mut rng, mpsl, &mut sdc_mem));
-    let mut host_resources = HostResources::new();
-    let stack = build_ble_stack(sdc, ble_addr(), &mut rng_gen, &mut host_resources).await;
 
     // Initialize flash
     let flash = Flash::take(mpsl, p.NVMC);
@@ -125,7 +122,7 @@ async fn main(spawner: Spawner) {
         pid: 0x4643,
         manufacturer: "Haobo",
         product_name: "RMK Keyboard",
-        serial_number: "vial:f64c2b3c:000001",
+        ..DeviceConfig::default()
     };
     let vial_config = VialConfig::new(VIAL_KEYBOARD_ID, VIAL_KEYBOARD_DEF, &[(0, 0), (1, 1)]);
     let storage_config = StorageConfig {
@@ -159,11 +156,12 @@ async fn main(spawner: Spawner) {
     let mut matrix = Matrix::<_, _, _, ROW, COL, true>::new(row_pins, col_pins, debouncer);
     // let mut matrix = TestMatrix::<ROW, COL>::new();
     let mut keyboard = Keyboard::new(&keymap);
+    let host_service = HostService::new(&keymap, &rmk_config);
 
-    join3(
-        run_all!(matrix),
-        keyboard.run(), // Keyboard is special
-        run_rmk(&keymap, &stack, &mut storage, rmk_config),
-    )
-    .await;
+    let mut ble_transport = BleTransport::new(sdc, ble_addr(), rmk_config).with_host_service(&host_service);
+    let mut wpm_processor = WpmProcessor::new();
+
+    let mut watchdog_runner = Nrf52Watchdog::default_runner(p.WDT);
+
+    run_all!(matrix, storage, ble_transport, wpm_processor, keyboard, watchdog_runner).await;
 }

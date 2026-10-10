@@ -3,7 +3,15 @@
 
 /// Get enabled RMK features list
 pub(crate) fn get_rmk_features() -> Option<Vec<String>> {
-    match cargo_toml::Manifest::from_path("./Cargo.toml") {
+    // Use an absolute path. `cargo_toml::Manifest::from_path` resolves the
+    // workspace root by walking ancestors of the given path; passing a
+    // relative `"./Cargo.toml"` makes its fallback canonicalize an empty
+    // path and fail with ENOENT inside workspace members.
+    let manifest_path = std::path::Path::new(
+        &std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"),
+    )
+    .join("Cargo.toml");
+    match cargo_toml::Manifest::from_path(&manifest_path) {
         Ok(manifest) => manifest
             .dependencies
             .iter()
@@ -17,12 +25,14 @@ pub(crate) fn get_rmk_features() -> Option<Vec<String>> {
 
                 let mut feature_set = dep.req_features().to_vec();
 
-                // Add default features to the feature list
+                // Add default features to the feature list.
+                // Must mirror `default = [...]` in rmk/Cargo.toml.
                 if default_features {
                     feature_set.push("defmt".to_string());
                     feature_set.push("storage".to_string());
                     feature_set.push("vial".to_string());
-                    feature_set.push("vial_lock".to_string());
+                    feature_set.push("host_lock".to_string());
+                    feature_set.push("watchdog".to_string());
                 }
                 feature_set
             }),

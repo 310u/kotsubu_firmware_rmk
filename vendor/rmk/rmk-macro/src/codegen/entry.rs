@@ -1,19 +1,23 @@
-use darling::FromMeta;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
+use rmk_config::SplitConnection;
 use rmk_config::resolved::hardware::{BoardConfig, CommunicationConfig};
-use rmk_config::resolved::{Hardware, Host};
+use rmk_config::resolved::{Behavior, Hardware, Host};
 use syn::{ItemFn, ItemMod};
 
 use super::override_helper::Overwritten;
+use crate::codegen::feature::{get_rmk_features, is_feature_enabled};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn expand_rmk_entry(
     hardware: &Hardware,
     host: &Host,
+    behavior: &Behavior,
     item_mod: &ItemMod,
     devices: Vec<TokenStream2>,
     processors: Vec<TokenStream2>,
     registered_processors: Vec<TokenStream2>,
+    watchdog_task: Option<TokenStream2>,
 ) -> TokenStream2 {
     // If there is a function with `#[Overwritten(entry)]`, override the entry
     if let Some((_, items)) = &item_mod.content {
@@ -21,8 +25,8 @@ pub(crate) fn expand_rmk_entry(
             .iter()
             .find_map(|item| {
                 if let syn::Item::Fn(item_fn) = &item
-                    && item_fn.attrs.len() == 1
-                    && let Ok(Overwritten::Entry) = Overwritten::from_meta(&item_fn.attrs[0].meta)
+                    && let Some(Ok(Overwritten::Entry)) =
+                        super::override_helper::find_overwritten(item_fn)
                 {
                     return Some(override_rmk_entry(item_fn));
                 }
@@ -31,12 +35,22 @@ pub(crate) fn expand_rmk_entry(
             .unwrap_or(rmk_entry_select(
                 hardware,
                 host,
+                behavior,
                 devices,
                 processors,
                 registered_processors,
+                watchdog_task,
             ))
     } else {
-        rmk_entry_select(hardware, host, devices, processors, registered_processors)
+        rmk_entry_select(
+            hardware,
+            host,
+            behavior,
+            devices,
+            processors,
+            registered_processors,
+            watchdog_task,
+        )
     }
 }
 
@@ -50,13 +64,27 @@ fn override_rmk_entry(item_fn: &ItemFn) -> TokenStream2 {
 pub(crate) fn rmk_entry_select(
     hardware: &Hardware,
     host: &Host,
+    behavior: &Behavior,
     devices: Vec<TokenStream2>,
     processors: Vec<TokenStream2>,
     registered_processors: Vec<TokenStream2>,
+    watchdog_task: Option<TokenStream2>,
 ) -> TokenStream2 {
+    let auto_mouse_layer_enabled = !behavior.auto_mouse_layer.is_empty();
+    let auto_mouse_layer_prelude = auto_mouse_layer_enabled.then(|| {
+        quote! {
+            let mut auto_mouse_layer = ::rmk::AutoMouseLayerRunner::new(&keymap);
+        }
+    });
     let devices_task = {
         let mut devs = devices.clone();
         devs.push(quote! {matrix});
+        if hardware.storage.is_some() {
+            devs.push(quote! {storage});
+        }
+        if auto_mouse_layer_enabled {
+            devs.push(quote! {auto_mouse_layer});
+        }
         quote! {
             ::rmk::run_all! (
                 #(#devs),*
@@ -73,24 +101,31 @@ pub(crate) fn rmk_entry_select(
         }
     };
 
-    // Remove the storage argument if disabled in config. The feature also needs to be disabled.
-    let storage = if hardware.storage.is_some() {
-        quote! {&mut storage,}
-    } else {
-        TokenStream2::new()
-    };
-    let keymap = if host.vial_enabled {
-        quote! { &keymap, }
-    } else {
-        quote! {}
-    };
     let board = &hardware.board;
     let communication = &hardware.communication;
-    let usb_driver_arg = match communication {
-        CommunicationConfig::Usb(_) | CommunicationConfig::Both(_, _) => quote! { driver, },
-        CommunicationConfig::Ble(_) => quote! {},
-        CommunicationConfig::None => panic!("USB and BLE are both disabled"),
+    // A BLE split central's transport takes one matrix region per peripheral.
+    let split_peripheral_matrices = match board {
+        BoardConfig::Split(split) if matches!(split.connection, SplitConnection::Ble) => {
+            let peripheral_matrices = split.peripheral.iter().map(|p| {
+                let rows = p.rows as u8;
+                let cols = p.cols as u8;
+                let row_offset = p.row_offset as u8;
+                let col_offset = p.col_offset as u8;
+                quote! {
+                    ::rmk::split::PeripheralMatrixConfig {
+                        rows: #rows,
+                        cols: #cols,
+                        row_offset: #row_offset,
+                        col_offset: #col_offset,
+                    }
+                }
+            });
+            quote! { , [#(#peripheral_matrices),*] }
+        }
+        _ => quote! {},
     };
+    let (transport_prelude, transport_tasks) =
+        transport_setup(host, communication, split_peripheral_matrices);
 
     let entry = match board {
         BoardConfig::Split(split_config) => {
@@ -99,94 +134,111 @@ pub(crate) fn rmk_entry_select(
             };
             let mut tasks = vec![devices_task, keyboard_task];
             tasks.extend(registered_processors);
-            if split_config.connection == "ble" {
-                let rmk_task = quote! {
-                    ::rmk::run_rmk(#keymap #usb_driver_arg &stack, #storage rmk_config)
-                };
-                tasks.push(rmk_task);
-                if !processors.is_empty() {
-                    tasks.push(processors_task);
-                };
-                split_config.peripheral.iter().enumerate().for_each(|(idx, p)| {
-                    let row = p.rows;
-                    let col = p.cols;
-                    let row_offset = p.row_offset;
-                    let col_offset = p.col_offset;
-                    tasks.push(quote! {
-                        ::rmk::split::central::run_peripheral_manager::<#row, #col, #row_offset, #col_offset, _>(
-                            #idx,
-                            &peripheral_addrs,
-                            &stack,
-                        )
-                    });
-                });
-                let scan_task = quote! {
-                    ::rmk::split::ble::central::scan_peripherals(&stack, &peripheral_addrs)
-                };
-                tasks.push(scan_task);
-                join_all_tasks(tasks)
-            } else if split_config.connection == "serial" {
-                let rmk_task = quote! {
-                    ::rmk::run_rmk(#keymap #usb_driver_arg #storage rmk_config),
-                };
-                tasks.push(rmk_task);
-                if !processors.is_empty() {
-                    tasks.push(processors_task);
-                };
-                let central_serials = split_config
-                    .central
-                    .serial
-                    .clone()
-                    .expect("No serial defined for central");
-                split_config.peripheral.iter().enumerate().for_each(|(idx, p)| {
-                    let row = p.rows;
-                    let col = p.cols;
-                    let row_offset = p.row_offset;
-                    let col_offset = p.col_offset;
-                    let uart_instance = format_ident!(
-                        "{}",
-                        central_serials
-                            .get(idx)
-                            .expect("No or not enough serial defined for peripheral in central")
-                            .instance
-                            .to_lowercase()
-                    );
-                    tasks.push(quote! {
-                        ::rmk::split::central::run_peripheral_manager::<#row, #col, #row_offset, #col_offset, _>(
-                            #idx,
-                            #uart_instance,
-                        )
-                    });
-                });
-                join_all_tasks(tasks)
-            } else {
-                panic!(
-                    "Invalid split connection type: {}, only \"ble\" and \"serial\" are supported",
-                    split_config.connection
-                );
+            tasks.extend(transport_tasks);
+            if let Some(t) = &watchdog_task {
+                tasks.push(t.clone());
+            }
+            match split_config.connection {
+                SplitConnection::Ble => {
+                    if !processors.is_empty() {
+                        tasks.push(processors_task);
+                    };
+                    let joined = join_all_tasks(tasks);
+                    quote! {
+                        #transport_prelude
+                        #auto_mouse_layer_prelude
+                        #joined
+                    }
+                }
+                SplitConnection::Serial => {
+                    if !processors.is_empty() {
+                        tasks.push(processors_task);
+                    };
+                    let central_serials = split_config
+                        .central
+                        .serial
+                        .clone()
+                        .expect("No serial defined for central");
+                    split_config
+                        .peripheral
+                        .iter()
+                        .enumerate()
+                        .for_each(|(idx, p)| {
+                            let row = p.rows as u8;
+                            let col = p.cols as u8;
+                            let row_offset = p.row_offset as u8;
+                            let col_offset = p.col_offset as u8;
+                            let uart_instance =
+                                format_ident!(
+                            "{}",
+                            central_serials
+                                .get(idx)
+                                .expect("No or not enough serial defined for peripheral in central")
+                                .instance
+                                .to_lowercase()
+                        );
+                            let rmk_features = get_rmk_features();
+                            let dfu_split_enabled = is_feature_enabled(&rmk_features, "dfu_split");
+                            let policy = if dfu_split_enabled {
+                                match p.update_policy.as_deref() {
+                                    Some("force") => {
+                                        quote! { ::rmk::split::central::UpdatePolicy::Force }
+                                    }
+                                    _ => quote! { ::rmk::split::central::UpdatePolicy::MatchHash },
+                                }
+                            } else {
+                                quote! {}
+                            };
+                            tasks.push(quote! {
+                                ::rmk::split::central::run_peripheral_manager(
+                                    #idx,
+                                    #uart_instance,
+                                    ::rmk::split::PeripheralMatrixConfig {
+                                        rows: #row,
+                                        cols: #col,
+                                        row_offset: #row_offset,
+                                        col_offset: #col_offset,
+                                    },
+                                    #policy
+                                )
+                            });
+                        });
+
+                    let joined = join_all_tasks(tasks);
+                    quote! {
+                        #transport_prelude
+                        #auto_mouse_layer_prelude
+                        #joined
+                    }
+                }
             }
         }
         BoardConfig::UniBody(_) => rmk_entry_unibody(
-            hardware,
-            host,
+            transport_prelude,
+            auto_mouse_layer_prelude,
+            transport_tasks,
             devices_task,
             processors_task,
             registered_processors,
+            watchdog_task,
         ),
     };
 
     quote! {
-        use ::rmk::input_device::Runnable;
+        use ::rmk::core_traits::Runnable;
         #entry
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rmk_entry_unibody(
-    hardware: &Hardware,
-    host: &Host,
+    transport_prelude: TokenStream2,
+    auto_mouse_layer_prelude: Option<TokenStream2>,
+    transport_tasks: Vec<TokenStream2>,
     devices_task: TokenStream2,
     processors_task: TokenStream2,
     registered_processors: Vec<TokenStream2>,
+    watchdog_task: Option<TokenStream2>,
 ) -> TokenStream2 {
     let keyboard_task = quote! {
         keyboard.run()
@@ -197,46 +249,77 @@ pub(crate) fn rmk_entry_unibody(
         tasks.push(processors_task);
     }
     tasks.extend(registered_processors);
-    // Remove the storage argument if disabled in config. The feature also needs to be disabled.
-    let storage = if hardware.storage.is_some() {
-        quote! {&mut storage,}
-    } else {
-        TokenStream2::new()
+    tasks.extend(transport_tasks);
+    if let Some(t) = watchdog_task {
+        tasks.push(t);
+    }
+    let joined = join_all_tasks(tasks);
+    quote! {
+        #transport_prelude
+        #auto_mouse_layer_prelude
+        #joined
+    }
+}
+
+/// Build (`let transport = ...;` prelude, transport run tasks) for the active
+/// communication config.
+fn transport_setup(
+    host: &Host,
+    communication: &CommunicationConfig,
+    split_peripheral_matrices: TokenStream2,
+) -> (TokenStream2, Vec<TokenStream2>) {
+    let wpm_prelude = quote! {
+        let mut wpm_processor = ::rmk::processor::builtin::wpm::WpmProcessor::new();
     };
-    // Remove the keymap argument if the vial is disabled
-    let keymap = if host.vial_enabled {
-        quote! { &keymap, }
+    let wpm_task = quote! { wpm_processor.run() };
+
+    let host_active = host.vial_enabled || host.rynk_enabled;
+
+    let with_host = if host_active {
+        quote! { .with_host_service(&host_service) }
     } else {
         quote! {}
     };
-    let communication = &hardware.communication;
+
+    let usb_prelude = quote! {
+        let mut usb_transport = ::rmk::usb::UsbTransport::new(driver, rmk_config.device_config)#with_host;
+    };
+    let ble_prelude = quote! {
+        let mut ble_transport = ::rmk::ble::BleTransport::new(ble_controller, ble_addr, rmk_config #split_peripheral_matrices) #with_host;
+    };
+    let ble_task = quote! { ble_transport.run() };
+
     match communication {
         CommunicationConfig::Usb(_) => {
-            let rmk_task = quote! {
-                ::rmk::run_rmk(#keymap driver, #storage rmk_config)
+            let prelude = quote! {
+                #wpm_prelude
+                #usb_prelude
             };
-            tasks.push(rmk_task);
-            join_all_tasks(tasks)
+            (prelude, vec![quote! { usb_transport.run() }, wpm_task])
         }
         CommunicationConfig::Ble(_) => {
-            let rmk_task = quote! {
-                ::rmk::run_rmk(#keymap &stack, #storage rmk_config)
+            let prelude = quote! {
+                #wpm_prelude
+                #ble_prelude
             };
-            tasks.push(rmk_task);
-            join_all_tasks(tasks)
+            (prelude, vec![ble_task, wpm_task])
         }
         CommunicationConfig::Both(_, _) => {
-            let rmk_task = quote! {
-                ::rmk::run_rmk(#keymap driver, &stack, #storage rmk_config)
+            let prelude = quote! {
+                #wpm_prelude
+                #usb_prelude
+                #ble_prelude
             };
-            tasks.push(rmk_task);
-            join_all_tasks(tasks)
+            (
+                prelude,
+                vec![quote! { usb_transport.run() }, ble_task, wpm_task],
+            )
         }
         CommunicationConfig::None => panic!("USB and BLE are both disabled"),
     }
 }
 
-pub fn expand_tasks(tasks: Vec<TokenStream2>) -> TokenStream2 {
+pub(crate) fn expand_tasks(tasks: Vec<TokenStream2>) -> TokenStream2 {
     let mut current_joined = quote! {};
     tasks.iter().enumerate().for_each(|(id, task)| {
         if id == 0 {

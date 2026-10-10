@@ -1,7 +1,94 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "passkey_entry")]
+use embassy_futures::select::{Either, select};
 use embassy_sync::signal::Signal;
+#[cfg(feature = "passkey_entry")]
+use embassy_time::{Duration, Instant, with_deadline};
 use rmk_types::keycode::HidKeyCode;
+#[cfg(feature = "passkey_entry")]
+use trouble_host::prelude::{DefaultPacketPool, GattConnection, GattConnectionEvent};
+
+#[doc(hidden)]
+pub fn passkey_entry_enabled() -> bool {
+    #[cfg(feature = "passkey_entry")]
+    {
+        crate::PASSKEY_ENTRY_ENABLED
+    }
+    #[cfg(not(feature = "passkey_entry"))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "passkey_entry")]
+pub(crate) struct PasskeyInputState {
+    pub(crate) deadline: Option<Instant>,
+    cleanup: Option<PasskeyCleanupGuard>,
+}
+
+#[cfg(feature = "passkey_entry")]
+impl PasskeyInputState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            deadline: None,
+            cleanup: None,
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.deadline = None;
+        drop(self.cleanup.take());
+    }
+
+    pub(crate) fn begin(&mut self) {
+        self.clear();
+        begin_passkey_entry_session();
+        self.cleanup = Some(PasskeyCleanupGuard::new());
+        self.deadline = Some(Instant::now() + Duration::from_secs(crate::PASSKEY_ENTRY_TIMEOUT_SECS as u64));
+    }
+}
+
+#[cfg(feature = "passkey_entry")]
+pub(crate) async fn next_gatt_event<'a, 'b>(
+    conn: &GattConnection<'a, 'b, DefaultPacketPool>,
+    passkey_state: &mut PasskeyInputState,
+) -> Option<GattConnectionEvent<'a, 'b, DefaultPacketPool>> {
+    if crate::PASSKEY_ENTRY_ENABLED
+        && let Some(deadline) = passkey_state.deadline
+    {
+        return match select(conn.next(), with_deadline(deadline, PASSKEY_RESPONSE.wait())).await {
+            Either::First(event) => Some(event),
+            Either::Second(Ok(Some(passkey))) => {
+                passkey_state.clear();
+
+                info!("[gatt] Passkey entered: submitting");
+                if let Err(e) = conn.raw().pass_key_input(passkey) {
+                    error!("[gatt] pass_key_input error: {:?}", e);
+                }
+                None
+            }
+            Either::Second(Ok(None)) => {
+                passkey_state.clear();
+
+                info!("[gatt] Passkey entry cancelled");
+                if let Err(e) = conn.raw().pass_key_cancel() {
+                    error!("[gatt] pass_key_cancel error: {:?}", e);
+                }
+                None
+            }
+            Either::Second(Err(_)) => {
+                passkey_state.clear();
+
+                warn!("[gatt] Passkey entry timeout");
+                let _ = conn.raw().pass_key_cancel();
+                None
+            }
+        };
+    }
+
+    Some(conn.next().await)
+}
 
 /// Maximum number of digits in a BLE passkey.
 pub const PASSKEY_LENGTH: usize = 6;
@@ -26,6 +113,27 @@ pub fn begin_passkey_entry_session() {
 /// End the current passkey entry session.
 pub fn end_passkey_entry_session() {
     PASSKEY_ENTRY_MODE.store(false, Ordering::Release);
+}
+
+/// Drop guard that clears passkey mode whenever the surrounding task exits.
+pub struct PasskeyCleanupGuard;
+
+impl Default for PasskeyCleanupGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PasskeyCleanupGuard {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Drop for PasskeyCleanupGuard {
+    fn drop(&mut self) {
+        end_passkey_entry_session();
+    }
 }
 
 /// Result of processing a key press in passkey entry mode.
@@ -203,9 +311,8 @@ pub fn hid_keycode_to_digit(k: HidKeyCode) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use embassy_futures::block_on;
-
     use super::*;
+    use crate::test_support::test_block_on as block_on;
 
     #[test]
     fn test_passkey_entry_state_basic() {
@@ -398,6 +505,19 @@ mod tests {
         assert_eq!(got, Some(222222));
 
         end_passkey_entry_session();
+        assert!(!PASSKEY_ENTRY_MODE.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_passkey_cleanup_guard_clears_active_mode_on_drop() {
+        begin_passkey_entry_session();
+        assert!(PASSKEY_ENTRY_MODE.load(Ordering::Acquire));
+
+        {
+            let _guard = PasskeyCleanupGuard::new();
+            assert!(PASSKEY_ENTRY_MODE.load(Ordering::Acquire));
+        }
+
         assert!(!PASSKEY_ENTRY_MODE.load(Ordering::Acquire));
     }
 }

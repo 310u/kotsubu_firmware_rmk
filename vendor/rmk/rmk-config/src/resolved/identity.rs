@@ -1,5 +1,3 @@
-use crate::keyboard::Basic;
-
 /// Keyboard identity for USB descriptors and BLE advertising.
 pub struct Identity {
     pub name: String,
@@ -7,13 +5,14 @@ pub struct Identity {
     pub product_id: u16,
     pub manufacturer: String,
     pub product_name: String,
-    pub serial_number: String,
+    /// `None` when `serial_number` is absent from `keyboard.toml`; the codegen will
+    /// substitute `::rmk::config::RMK_BUILD_INFO` so the default is version-stamped.
+    pub serial_number: Option<String>,
 }
 
 impl crate::KeyboardTomlConfig {
     /// Resolve keyboard identity from TOML config.
     pub fn identity(&self) -> Result<Identity, String> {
-        let default = Basic::default();
         let keyboard = self
             .keyboard
             .as_ref()
@@ -22,9 +21,12 @@ impl crate::KeyboardTomlConfig {
             name: keyboard.name.clone(),
             vendor_id: keyboard.vendor_id,
             product_id: keyboard.product_id,
-            manufacturer: keyboard.manufacturer.clone().unwrap_or(default.manufacturer),
-            product_name: keyboard.product_name.clone().unwrap_or(default.product_name),
-            serial_number: keyboard.serial_number.clone().unwrap_or(default.serial_number),
+            manufacturer: keyboard.manufacturer.clone().unwrap_or_else(|| "RMK".to_string()),
+            product_name: keyboard
+                .product_name
+                .clone()
+                .unwrap_or_else(|| "RMK Keyboard".to_string()),
+            serial_number: keyboard.serial_number.clone(),
         })
     }
 }
