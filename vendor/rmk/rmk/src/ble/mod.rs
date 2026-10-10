@@ -306,14 +306,12 @@ async fn run_ble_keyboard<
                     // Do NOT emit BleState::Connected here. gatt_events_task emits
                     // Connected when it sees GattConnectionEvent::Encrypted.
                     let active_bond_info = profile_manager.active_bond_info();
-                    // Check the bond info after the connection is just created.
-                    if let Some(bond) = &active_bond_info
-                        && !bond.info.identity.match_identity(&conn.raw().peer_identity())
-                    {
-                        warn!("[ble] connected peer doesn't match the active profile, disconnecting");
-                        disconnect(&conn).await;
-                        continue;
-                    }
+                    // kotsubu patch: the active-profile identity check (#1024)
+                    // moved from here into gatt_events_task's Encrypted handler.
+                    // The accept-time drop fired before SMP could run, so a host
+                    // that reconnects from an address the stored IRK cannot
+                    // resolve (e.g. Windows after "remove device") could never
+                    // re-pair while the old bond was still on the profile.
                     // When connecting to BLE host, check the connected peer is not a dongle.
                     #[cfg(feature = "dongle")]
                     if crate::state::current_profile() != crate::ble::profile::DONGLE_PROFILE
@@ -425,7 +423,11 @@ pub(crate) async fn ble_task<C: Controller, P: PacketPool, E: EventHandler>(mut 
 ///
 /// This function will handle the GATT events and process them.
 /// This is how we interact with read and write requests.
-async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, DefaultPacketPool>) -> Result<(), Error> {
+async fn gatt_events_task(
+    server: &Server<'_>,
+    conn: &GattConnection<'_, '_, DefaultPacketPool>,
+    active_bond_info: Option<&crate::ble::profile::ProfileInfo>,
+) -> Result<(), Error> {
     let level = server.battery_service.level;
     #[cfg(feature = "split")]
     let peripheral_levels = server.peripheral_battery_services.levels;
@@ -483,6 +485,19 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
             }
             GattConnectionEvent::Encrypted { security_level, .. } => {
                 info!("[gatt] encrypted: {:?}", security_level);
+                // kotsubu patch: active-profile identity check (#1024), now at
+                // encryption time so SMP pairing was free to run first. A bond
+                // mismatch here means the link is held by a host that is not
+                // the active profile's peer — drop it. A fresh pairing that
+                // replaced this profile's bond arrives with a matching
+                // identity (peer_identity is updated on BondAdded).
+                if let Some(bond) = active_bond_info
+                    && !bond.info.identity.match_identity(&conn.raw().peer_identity())
+                {
+                    warn!("[ble] encrypted peer doesn't match the active profile, disconnecting");
+                    disconnect(conn).await;
+                    break;
+                }
                 set_ble_state(BleState::Connected);
             }
             GattConnectionEvent::Gatt { event: gatt_event } => {
@@ -796,7 +811,7 @@ async fn serve_keyboard_connection<
 
     // CCCD lookup uses cached bond info to avoid a cancellable flash read while
     // this future is racing other arms of an outer `select`.
-    if let Some(bond_info) = active_bond_info
+    if let Some(bond_info) = &active_bond_info
         && bond_info.info.identity.match_identity(&conn.raw().peer_identity())
     {
         info!("Loading CCCD table: {:?}", bond_info.cccd_table);
@@ -826,7 +841,7 @@ async fn serve_keyboard_connection<
 
     let communication_task = async {
         if let Either3::First(e) = select3(
-            gatt_events_task(server, conn),
+            gatt_events_task(server, conn, active_bond_info.as_ref()),
             set_conn_params(stack, conn),
             battery_task,
         )
