@@ -57,7 +57,7 @@ BLE プロファイル色の対応は次の通りです。
 ### Common
 
 ```bash
-PATH="$HOME/.cargo/bin:$PATH" rustup target add thumbv7em-none-eabihf
+rustup target add thumbv7em-none-eabihf
 ```
 
 RMK 0.9.0 の BLE セキュリティ実装（`p256-cortex-m4`）をコンパイルするため、`arm-none-eabi-gcc`（Arm GNU Toolchain）が必要です。CI と同じ `gcc-arm-none-eabi` を入れてください（Windows は [Arm GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads) の zip 版を展開して `bin` を PATH に追加すると `arm-none-eabi-gcc` が使えます）。
@@ -72,7 +72,7 @@ sudo apt-get install -y gcc-arm-none-eabi
 Install `probe-rs`, then connect your SWD probe to the XIAO BLE.
 
 ```bash
-PATH="$HOME/.cargo/bin:$PATH" cargo install --locked probe-rs-tools
+cargo install --locked probe-rs-tools
 ```
 
 On Linux, you may also need the `probe-rs` udev rules before the probe becomes visible to the CLI.
@@ -84,8 +84,8 @@ This project already uses the Adafruit nRF52 bootloader layout in [memory.x](mem
 Install the helper tools once:
 
 ```bash
-PATH="$HOME/.cargo/bin:$PATH" cargo install --locked cargo-binutils cargo-hex-to-uf2 flip-link
-PATH="$HOME/.cargo/bin:$PATH" rustup component add llvm-tools
+cargo install --locked cargo-binutils cargo-hex-to-uf2 flip-link
+rustup component add llvm-tools
 ```
 
 ## Flashing
@@ -94,6 +94,14 @@ PATH="$HOME/.cargo/bin:$PATH" rustup component add llvm-tools
 
 `cargo run --release` uses the runner from [.cargo/config.toml](.cargo/config.toml#L1) and writes directly with `probe-rs`.
 
+Windows (PowerShell):
+
+```powershell
+.\scripts\flash_probe.ps1
+```
+
+Linux / macOS:
+
 ```bash
 bash scripts/flash_probe.sh
 ```
@@ -101,41 +109,67 @@ bash scripts/flash_probe.sh
 If you prefer to run the raw command directly:
 
 ```bash
-PATH="$HOME/.cargo/bin:$PATH" cargo run --release --bin kotsubu-rmk
+cargo run --release --bin kotsubu-rmk
 ```
 
 If `probe-rs` says `No connected probes were found`, check the USB cable, SWD wiring, and the Linux udev setup for your debug probe first.
 
 ### 2. Build UF2 and copy it over USB
 
-Build the UF2 firmware:
+Build the UF2 firmware.
+
+Windows (PowerShell):
+
+```powershell
+.\scripts\build_uf2.ps1
+```
+
+Linux / macOS:
 
 ```bash
 bash scripts/build_uf2.sh
 ```
 
-This generates:
+Both generate:
 
 - `kotsubu-rmk.hex`
 - `kotsubu-rmk.uf2`
 
-Put the XIAO BLE into bootloader mode, wait for the UF2 USB drive to appear, then copy:
+Put the XIAO BLE into bootloader mode, wait for the UF2 USB drive to appear, then copy.
+
+Windows (PowerShell):
+
+```powershell
+.\scripts\copy_uf2.ps1
+```
+
+Linux / macOS:
 
 ```bash
 bash scripts/flash_uf2.sh
 ```
 
-The copy task uses [scripts/copy_uf2.sh](scripts/copy_uf2.sh), which looks for a mounted drive containing `INFO_UF2.TXT`.
+`flash_uf2.sh` / `flash_uf2.ps1` は「ビルド + コピー」をまとめて行きます。
+
+The copy scripts look for a mounted drive containing `INFO_UF2.TXT`.
 If normal reset is not enough, press the XIAO reset button twice quickly to enter bootloader mode.
 
 If you want to copy manually instead:
+
+Windows (PowerShell, `X:` はその時点のドライブレター):
+
+```powershell
+Copy-Item kotsubu-rmk.uf2 X:\
+```
+
+Linux / macOS:
 
 ```bash
 cp kotsubu-rmk.uf2 /path/to/UF2_DRIVE/
 sync
 ```
 
-If you prefer the RMK-style `cargo-make` task, [Makefile.toml](Makefile.toml#L1) also provides `uf2`, `flash-probe`, and `flash-uf2`.
+If you prefer the RMK-style `cargo-make` task, [Makefile.toml](Makefile.toml#L1) also provides `uf2`, `flash-probe`, and `flash-uf2`. Note that the `flash-uf2` task は Linux 用の `scripts/copy_uf2.sh` を呼ぶため、Windows では上記の PowerShell スクリプトを使ってください。
 
 ## Bootloader Notes
 
@@ -146,6 +180,21 @@ If you prefer the RMK-style `cargo-make` task, [Makefile.toml](Makefile.toml#L1)
 
 ## Quick Reference
 
+Windows (PowerShell):
+
+```powershell
+# Debug probe flash
+.\scripts\flash_probe.ps1
+
+# Build UF2
+.\scripts\build_uf2.ps1
+
+# Copy UF2 to the mounted bootloader drive
+.\scripts\copy_uf2.ps1
+```
+
+Linux / macOS:
+
 ```bash
 # Debug probe flash
 bash scripts/flash_probe.sh
@@ -154,7 +203,13 @@ bash scripts/flash_probe.sh
 bash scripts/build_uf2.sh
 
 # Copy UF2 to the mounted bootloader drive
-bash scripts/flash_uf2.sh
+bash scripts/copy_uf2.sh
+```
+
+PowerShell の実行ポリシーでスクリプトが弾かれる場合は次のように実行してください。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_uf2.ps1
 ```
 
 ## License
